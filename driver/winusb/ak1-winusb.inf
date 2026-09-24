@@ -1,0 +1,34 @@
+; Binds the Audio Kontrol 1 to the inbox WinUSB driver for user-mode protocol work.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+DriverVer   = 09/24/2026,0.1.0.0
+CatalogFile = ak1-winusb.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = Devices,NTamd64
+
+[Devices.NTamd64]
+%DeviceName% = Ak1_Install, USB\VID_17CC&PID_0815
+
+[Ak1_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[Ak1_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[Ak1_Install.HW]
+AddReg = Ak1_AddReg
+
+[Ak1_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{1ceaa755-a4c9-4fb8-a4a0-2e913917f458}"
+
+[Strings]
+ProviderName = "ak1-driver"
+DeviceName   = "Audio Kontrol 1 (WinUSB)"

@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/ak1-proto", "tools/ak1-probe"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
