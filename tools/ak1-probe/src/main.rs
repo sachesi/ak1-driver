@@ -10,7 +10,8 @@ use ak1_proto::{EP_AUDIO_IN, MAX_PACKET_SIZE, Reply, SampleRate};
 use usb::{Ak1, IsochReader, Result};
 
 const USAGE: &str = "usage: ak1-probe info | capture <rate-hz> <seconds> [raw-output-file] | endpoints \
-                     | play <endpoint> <seconds> <tone-hz> | record <endpoint> <seconds>";
+                     | play <endpoint> <seconds> <tone-hz> [exclusive-rate-hz] \
+                     | record <endpoint> <seconds> [exclusive-rate-hz]";
 const MICROFRAMES_PER_SECOND: u64 = 8000;
 
 fn main() -> ExitCode {
@@ -36,8 +37,14 @@ fn run(args: &[String]) -> Result<()> {
             capture(rate, seconds.parse()?, rest.first().map(String::as_str))
         }
         [cmd] if cmd == "endpoints" => wasapi::list(),
-        [cmd, endpoint, seconds, tone] if cmd == "play" => wasapi::play(endpoint, seconds.parse()?, tone.parse()?),
-        [cmd, endpoint, seconds] if cmd == "record" => wasapi::record(endpoint, seconds.parse()?),
+        [cmd, endpoint, seconds, tone, rate @ ..] if cmd == "play" && rate.len() <= 1 => {
+            let rate = rate.first().map(|r| r.parse()).transpose()?;
+            wasapi::play(endpoint, seconds.parse()?, tone.parse()?, rate)
+        }
+        [cmd, endpoint, seconds, rate @ ..] if cmd == "record" && rate.len() <= 1 => {
+            let rate = rate.first().map(|r| r.parse()).transpose()?;
+            wasapi::record(endpoint, seconds.parse()?, rate)
+        }
         _ => Err(USAGE.into()),
     }
 }
