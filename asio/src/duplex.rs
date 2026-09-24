@@ -1,7 +1,8 @@
-//! Full-duplex streaming over the driver's three endpoints, opened in WASAPI
-//! exclusive event-driven mode. Capture drives the ASIO buffer switch; output
-//! blocks go through small FIFOs to the render endpoints, which the same
-//! device clock paces.
+//! Full-duplex streaming over the driver's endpoints, opened in WASAPI
+//! exclusive event-driven mode. Only the endpoints whose channels the host
+//! activated are opened. Capture drives the ASIO buffer switch when inputs are
+//! active, otherwise the first render endpoint does; output blocks go through
+//! small FIFOs to the render endpoints, which the same device clock paces.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -16,17 +17,21 @@ use windows::Win32::Media::Audio::{
     WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eCapture, eRender,
 };
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT};
-use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
-    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, SetEvent, WaitForMultipleObjects,
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, ResetEvent, SetEvent,
+    WaitForMultipleObjects,
 };
 use windows::core::{Interface, Result, w};
+
+use crate::abi::{K_ASIO_RESET_REQUEST, K_ASIO_SELECTOR_SUPPORTED};
 
 pub const INPUTS: usize = 2;
 pub const OUTPUTS: usize = 4;
 const USB_VID_PID: &str = "vid_17cc&pid_0815";
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
+/// Without an audio event for this long the device is considered gone.
 const WAIT_MS: u32 = 1000;
 
 pub struct Endpoints {
@@ -35,11 +40,9 @@ pub struct Endpoints {
     input12: IMMDevice,
 }
 
-/// Finds the endpoints whose KS filter is one of our circuits.
+/// Finds the endpoints whose KS filter is one of our circuits. Needs a
+/// multithreaded apartment in the process (see `CoIncrementMTAUsage`).
 pub fn find_endpoints() -> Result<Option<Endpoints>> {
-    // Hosts usually call from a thread that already joined an apartment;
-    // MMDevice and WASAPI objects work from either kind.
-    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
     let (mut output12, mut output34, mut input12) = (None, None, None);
     for flow in [eRender, eCapture] {
@@ -151,6 +154,16 @@ pub struct Host {
     pub outputs: [Option<usize>; OUTPUTS],
 }
 
+impl Host {
+    fn uses_input(&self) -> bool {
+        self.inputs.iter().any(Option::is_some)
+    }
+
+    fn uses_output_pair(&self, pair: usize) -> bool {
+        self.outputs[2 * pair..2 * pair + 2].iter().any(Option::is_some)
+    }
+}
+
 /// Position and time of the most recent buffer switch.
 #[derive(Default)]
 pub struct Clock {
@@ -159,8 +172,8 @@ pub struct Clock {
 }
 
 pub struct Duplex {
-    renders: [Stream; 2],
-    capture: Stream,
+    renders: [Option<Stream>; 2],
+    capture: Option<Stream>,
     stop: HANDLE,
     thread: Option<JoinHandle<()>>,
 }
@@ -170,37 +183,47 @@ pub struct Duplex {
 unsafe impl Send for Duplex {}
 
 impl Duplex {
-    pub fn open(endpoints: &Endpoints, rate: u32, buffer_frames: u32) -> Result<Duplex> {
+    /// Opens the endpoints that carry the channels `host` uses.
+    pub fn open(endpoints: &Endpoints, host: &Host) -> Result<Duplex> {
+        let (rate, frames) = (host.rate, host.buffer_frames as u32);
+        let open = |device: &IMMDevice, used: bool| used.then(|| open_stream(device, rate, frames)).transpose();
         Ok(Duplex {
             renders: [
-                open_stream(&endpoints.output12, rate, buffer_frames)?,
-                open_stream(&endpoints.output34, rate, buffer_frames)?,
+                open(&endpoints.output12, host.uses_output_pair(0))?,
+                open(&endpoints.output34, host.uses_output_pair(1))?,
             ],
-            capture: open_stream(&endpoints.input12, rate, buffer_frames)?,
+            capture: open(&endpoints.input12, host.uses_input())?,
             stop: unsafe { CreateEventW(None, true, false, None)? },
             thread: None,
         })
     }
 
+    fn streams(&self) -> impl Iterator<Item = &Stream> {
+        self.capture.iter().chain(self.renders.iter().flatten())
+    }
+
     pub fn start(&mut self, host: Host, clock: Arc<Clock>) -> Result<()> {
-        for render in &self.renders {
+        let mut renders = [None, None];
+        let mut events = vec![self.stop];
+        let mut sources = vec![Source::Stop];
+        if let Some(capture) = &self.capture {
+            events.push(capture.event);
+            sources.push(Source::Capture);
+        }
+        for (pair, render) in self.renders.iter().enumerate() {
+            let Some(render) = render else { continue };
             let service: IAudioRenderClient = unsafe { render.client.GetService()? };
             unsafe { service.GetBuffer(render.frames)? };
             unsafe { service.ReleaseBuffer(render.frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)? };
+            renders[pair] = Some(Render { client: service, frames: render.frames });
+            events.push(render.event);
+            sources.push(Source::Render(pair));
         }
-        let worker = Worker {
-            capture: unsafe { self.capture.client.GetService()? },
-            renders: [unsafe { self.renders[0].client.GetService()? }, unsafe {
-                self.renders[1].client.GetService()?
-            }],
-            render_frames: [self.renders[0].frames, self.renders[1].frames],
-            events: [self.stop, self.capture.event, self.renders[0].event, self.renders[1].event],
-            host,
-            clock,
-        };
-        unsafe { windows::Win32::System::Threading::ResetEvent(self.stop)? };
-        for client in [&self.capture.client, &self.renders[0].client, &self.renders[1].client] {
-            unsafe { client.Start()? };
+        let capture = self.capture.as_ref().map(|c| unsafe { c.client.GetService() }).transpose()?;
+        let worker = Worker { capture, renders, events, sources, host, clock };
+        unsafe { ResetEvent(self.stop)? };
+        for stream in self.streams() {
+            unsafe { stream.client.Start()? };
         }
         self.thread = Some(std::thread::spawn(move || worker.run()));
         Ok(())
@@ -211,9 +234,9 @@ impl Duplex {
             let _ = unsafe { SetEvent(self.stop) };
             let _ = thread.join();
         }
-        for client in [&self.capture.client, &self.renders[0].client, &self.renders[1].client] {
-            let _ = unsafe { client.Stop() };
-            let _ = unsafe { client.Reset() };
+        for stream in self.streams() {
+            let _ = unsafe { stream.client.Stop() };
+            let _ = unsafe { stream.client.Reset() };
         }
     }
 }
@@ -225,94 +248,130 @@ impl Drop for Duplex {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Source {
+    Stop,
+    Capture,
+    Render(usize),
+}
+
+struct Render {
+    client: IAudioRenderClient,
+    frames: u32,
+}
+
 struct Worker {
-    capture: IAudioCaptureClient,
-    renders: [IAudioRenderClient; 2],
-    render_frames: [u32; 2],
-    events: [HANDLE; 4],
+    capture: Option<IAudioCaptureClient>,
+    renders: [Option<Render>; 2],
+    events: Vec<HANDLE>,
+    sources: Vec<Source>,
     host: Host,
     clock: Arc<Clock>,
 }
 
 unsafe impl Send for Worker {}
 
+/// Streaming state owned by the worker thread.
+struct State {
+    captured: VecDeque<[i32; 2]>,
+    outputs: [VecDeque<[i32; 2]>; 2],
+    index: usize,
+    position: u64,
+    qpc_hz: i64,
+}
+
 impl Worker {
     fn run(self) {
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let mut task_index = 0;
         let task = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) };
         let frames = self.host.buffer_frames;
-        let mut captured: VecDeque<[i32; 2]> = VecDeque::with_capacity(8 * frames);
-        let mut outputs: [VecDeque<[i32; 2]>; 2] = std::array::from_fn(|_| VecDeque::with_capacity(8 * frames));
-        for fifo in &mut outputs {
-            fifo.extend(std::iter::repeat_n([0; 2], frames));
-        }
-        let mut index = 0;
-        let mut position = 0u64;
-        let (mut qpc_hz, mut qpc) = (0i64, 0i64);
-        let _ = unsafe { QueryPerformanceFrequency(&mut qpc_hz) };
-        loop {
+        let mut state = State {
+            captured: VecDeque::with_capacity(8 * frames),
+            outputs: std::array::from_fn(|_| VecDeque::from(vec![[0; 2]; frames])),
+            index: 0,
+            position: 0,
+            qpc_hz: 0,
+        };
+        let _ = unsafe { QueryPerformanceFrequency(&mut state.qpc_hz) };
+        // Without inputs, the first render endpoint paces the buffer switches.
+        let pacing_render = if self.capture.is_some() { None } else { self.renders.iter().position(Option::is_some) };
+
+        let failed = loop {
             let wait = unsafe { WaitForMultipleObjects(&self.events, false, WAIT_MS) };
             if wait == WAIT_TIMEOUT {
-                continue;
+                break true;
             }
-            match wait.0.wrapping_sub(WAIT_OBJECT_0.0) {
-                1 => {
-                    if self.drain_capture(&mut captured).is_err() {
-                        break;
+            let signaled = wait.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+            let result = match self.sources.get(signaled) {
+                Some(Source::Stop) => break false,
+                Some(Source::Capture) => self.drain_capture(&mut state.captured).map(|()| {
+                    while state.captured.len() >= frames {
+                        self.switch(&mut state);
                     }
-                    while captured.len() >= frames {
-                        let _ = unsafe { QueryPerformanceCounter(&mut qpc) };
-                        let now_ns = (qpc as u128 * 1_000_000_000 / qpc_hz as u128) as u64;
-                        self.clock.sample_position.store(position, Ordering::Release);
-                        self.clock.system_time_ns.store(now_ns, Ordering::Release);
-                        self.switch(index, &mut captured, &mut outputs, position, now_ns);
-                        position += frames as u64;
-                        index ^= 1;
+                }),
+                Some(&Source::Render(pair)) => {
+                    if pacing_render == Some(pair) {
+                        let needed = self.renders[pair].as_ref().map_or(0, |r| r.frames as usize);
+                        while state.outputs[pair].len() < needed {
+                            self.switch(&mut state);
+                        }
                     }
+                    self.feed_render(pair, &mut state.outputs[pair])
                 }
-                n @ (2 | 3) => {
-                    let k = n as usize - 2;
-                    if self.feed_render(k, &mut outputs[k]).is_err() {
-                        break;
-                    }
-                }
-                _ => break,
+                None => break true,
+            };
+            if result.is_err() {
+                break true;
             }
+        };
+        if failed {
+            self.request_reset();
         }
         if let Ok(task) = task {
             let _ = unsafe { AvRevertMmThreadCharacteristics(task) };
         }
     }
 
+    /// Asks the host to tear the session down and build it again.
+    fn request_reset(&self) {
+        let message = self.host.callbacks.asio_message;
+        let null = std::ptr::null_mut();
+        if unsafe { message(K_ASIO_SELECTOR_SUPPORTED, K_ASIO_RESET_REQUEST, null, null.cast()) } == 1 {
+            unsafe { message(K_ASIO_RESET_REQUEST, 0, null, null.cast()) };
+        }
+    }
+
     fn drain_capture(&self, captured: &mut VecDeque<[i32; 2]>) -> Result<()> {
+        let Some(capture) = &self.capture else { return Ok(()) };
         loop {
-            let available = unsafe { self.capture.GetNextPacketSize()? };
+            let available = unsafe { capture.GetNextPacketSize()? };
             if available == 0 {
                 return Ok(());
             }
             let (mut data, mut count, mut flags) = (std::ptr::null_mut(), 0u32, 0u32);
-            unsafe { self.capture.GetBuffer(&mut data, &mut count, &mut flags, None, None)? };
+            unsafe { capture.GetBuffer(&mut data, &mut count, &mut flags, None, None)? };
             let samples = unsafe { std::slice::from_raw_parts(data.cast::<[i32; 2]>(), count as usize) };
             captured.extend(samples.iter().copied());
-            unsafe { self.capture.ReleaseBuffer(count)? };
+            unsafe { capture.ReleaseBuffer(count)? };
         }
     }
 
-    fn switch(
-        &self,
-        index: usize,
-        captured: &mut VecDeque<[i32; 2]>,
-        outputs: &mut [VecDeque<[i32; 2]>; 2],
-        position: u64,
-        now_ns: u64,
-    ) {
+    fn switch(&self, state: &mut State) {
         let frames = self.host.buffer_frames;
+        let index = state.index;
+        let mut qpc = 0;
+        let _ = unsafe { QueryPerformanceCounter(&mut qpc) };
+        let now_ns = (qpc as u128 * 1_000_000_000 / state.qpc_hz as u128) as u64;
+        self.clock.sample_position.store(state.position, Ordering::Release);
+        self.clock.system_time_ns.store(now_ns, Ordering::Release);
+
         let half = |base: usize| (base as *mut i32).wrapping_add(index * frames);
-        for (i, frame) in captured.drain(..frames).enumerate() {
-            for (channel, sample) in frame.into_iter().enumerate() {
-                if let Some(base) = self.host.inputs[channel] {
-                    unsafe { half(base).add(i).write(sample) };
+        if self.capture.is_some() {
+            for (i, frame) in state.captured.drain(..frames).enumerate() {
+                for (channel, sample) in frame.into_iter().enumerate() {
+                    if let Some(base) = self.host.inputs[channel] {
+                        unsafe { half(base).add(i).write(sample) };
+                    }
                 }
             }
         }
@@ -322,7 +381,7 @@ impl Worker {
             let mut time: crate::abi::AsioTime = unsafe { std::mem::zeroed() };
             time.time_info.speed = 1.0;
             time.time_info.system_time = now_ns.into();
-            time.time_info.sample_position = position.into();
+            time.time_info.sample_position = state.position.into();
             time.time_info.sample_rate = f64::from(self.host.rate);
             time.time_info.flags =
                 crate::abi::K_SYSTEM_TIME_VALID | crate::abi::K_SAMPLE_POSITION_VALID | crate::abi::K_SAMPLE_RATE_VALID;
@@ -331,7 +390,10 @@ impl Worker {
             unsafe { (callbacks.buffer_switch)(index as i32, 1) };
         }
 
-        for (pair, fifo) in outputs.iter_mut().enumerate() {
+        for (pair, fifo) in state.outputs.iter_mut().enumerate() {
+            if self.renders[pair].is_none() {
+                continue;
+            }
             for i in 0..frames {
                 let sample = |channel: usize| {
                     self.host.outputs[channel].map_or(0, |base| unsafe { half(base).add(i).read() })
@@ -341,14 +403,16 @@ impl Worker {
             let excess = fifo.len().saturating_sub(4 * frames);
             fifo.drain(..excess);
         }
+        state.position += frames as u64;
+        state.index ^= 1;
     }
 
-    fn feed_render(&self, k: usize, fifo: &mut VecDeque<[i32; 2]>) -> Result<()> {
-        let count = self.render_frames[k];
-        let data = unsafe { self.renders[k].GetBuffer(count)? }.cast::<[i32; 2]>();
-        for i in 0..count as usize {
+    fn feed_render(&self, pair: usize, fifo: &mut VecDeque<[i32; 2]>) -> Result<()> {
+        let Some(render) = &self.renders[pair] else { return Ok(()) };
+        let data = unsafe { render.client.GetBuffer(render.frames)? }.cast::<[i32; 2]>();
+        for i in 0..render.frames as usize {
             unsafe { data.add(i).write(fifo.pop_front().unwrap_or([0; 2])) };
         }
-        unsafe { self.renders[k].ReleaseBuffer(count, 0) }
+        unsafe { render.client.ReleaseBuffer(render.frames, 0) }
     }
 }

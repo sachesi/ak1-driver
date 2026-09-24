@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
+use windows::Win32::Media::Audio::AUDCLNT_E_UNSUPPORTED_FORMAT;
+use windows::Win32::System::Com::{CO_MTA_USAGE_COOKIE, CoDecrementMTAUsage, CoIncrementMTAUsage};
 use windows_core::{GUID, IUnknown, Interface};
 
 use crate::abi::*;
@@ -29,10 +31,24 @@ struct Session {
 }
 
 struct Driver {
+    /// Keeps a multithreaded apartment alive so the endpoints work from the
+    /// host's threads and the streaming thread without joining the host's
+    /// threads to an apartment.
+    mta: Option<CO_MTA_USAGE_COOKIE>,
     endpoints: Option<Endpoints>,
     error: String,
     rate: u32,
     session: Option<Session>,
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.session = None;
+        self.endpoints = None;
+        if let Some(cookie) = self.mta.take() {
+            let _ = unsafe { CoDecrementMTAUsage(cookie) };
+        }
+    }
 }
 
 #[repr(C)]
@@ -51,7 +67,13 @@ impl AsioObject {
         Box::into_raw(Box::new(AsioObject {
             vtbl: &VTBL,
             refs: AtomicU32::new(1),
-            driver: Mutex::new(Driver { endpoints: None, error: String::new(), rate: DEFAULT_RATE, session: None }),
+            driver: Mutex::new(Driver {
+                mta: None,
+                endpoints: None,
+                error: String::new(),
+                rate: DEFAULT_RATE,
+                session: None,
+            }),
             clock: Arc::new(Clock::default()),
         }))
     }
@@ -131,6 +153,15 @@ unsafe extern "system" fn release(this: *mut AsioObject) -> u32 {
 
 unsafe extern "system" fn init(this: *mut AsioObject, _sys_handle: *mut c_void) -> AsioBool {
     let mut driver = unsafe { (*this).driver() };
+    if driver.mta.is_none() {
+        match unsafe { CoIncrementMTAUsage() } {
+            Ok(cookie) => driver.mta = Some(cookie),
+            Err(e) => {
+                driver.error = format!("starting COM failed: {e}");
+                return 0;
+            }
+        }
+    }
     match find_endpoints() {
         Ok(Some(endpoints)) => {
             driver.endpoints = Some(endpoints);
@@ -342,10 +373,6 @@ unsafe extern "system" fn create_buffers(
         }
     }
 
-    let duplex = match Duplex::open(endpoints, rate, buffer_size as u32) {
-        Ok(duplex) => duplex,
-        Err(e) => return driver.fail(ASE_HW_MALFUNCTION, format!("opening the device at {rate} Hz failed: {e}")),
-    };
     let mut buffers = Vec::with_capacity(infos.len());
     for info in infos.iter_mut() {
         let mut buffer = vec![0i32; 2 * frames].into_boxed_slice();
@@ -377,6 +404,14 @@ unsafe extern "system" fn create_buffers(
     host.time_info = unsafe {
         ((*callbacks).asio_message)(K_ASIO_SUPPORTS_TIME_INFO, 0, std::ptr::null_mut(), std::ptr::null_mut())
     } == 1;
+    let duplex = match Duplex::open(endpoints, &host) {
+        Ok(duplex) => duplex,
+        // The device has one clock, which another stream may hold at another rate.
+        Err(e) if e.code() == AUDCLNT_E_UNSUPPORTED_FORMAT => {
+            return driver.fail(ASE_NO_CLOCK, format!("another application is using the device at a rate other than {rate} Hz"));
+        }
+        Err(e) => return driver.fail(ASE_HW_MALFUNCTION, format!("opening the device at {rate} Hz failed: {e}")),
+    };
     driver.session = Some(Session { duplex, buffers, host, active_inputs, active_outputs, running: false });
     ASE_OK
 }
