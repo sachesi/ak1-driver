@@ -33,7 +33,9 @@ Copy-Item (Join-Path $root "target\$profileName\ak1_acx.pdb") (Join-Path $packag
 Copy-Item (Join-Path $root 'driver\ak1-acx\ak1acx.inf') $package
 $inf = Join-Path $package 'ak1acx.inf'
 
-& "$bin\x64\stampinf.exe" -f $inf -d * -v * -a amd64 -k 1.33 -x
+# The commit count keeps versions increasing without depending on the build machine's clock.
+$version = "0.1.0.$(git -C $root rev-list --count HEAD)"
+& "$bin\x64\stampinf.exe" -f $inf -d * -v $version -a amd64 -k 1.33 -x
 if ($LASTEXITCODE) { throw "stampinf failed with exit code $LASTEXITCODE" }
 & "$bin\x86\inf2cat.exe" /driver:$package /os:10_x64 /uselocaltime
 if ($LASTEXITCODE) { throw "inf2cat failed with exit code $LASTEXITCODE" }
