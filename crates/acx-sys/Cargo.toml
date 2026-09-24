@@ -4,6 +4,11 @@ edition.workspace = true
 version.workspace = true
 links = "acxstub"
 
+# Kernel-mode code; a user-mode test binary cannot link against it.
+[lib]
+test = false
+doctest = false
+
 [dependencies]
 paste = "1.0.15"
 wdk-sys.workspace = true
