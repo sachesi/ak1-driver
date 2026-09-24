@@ -10,9 +10,9 @@ use windows::core::{PCWSTR, Result, w};
 
 pub const RATES: [u32; 5] = [44_100, 48_000, 88_200, 96_000, 192_000];
 /// Buffer sizes offered to hosts, as multiples of the smallest one.
-pub const BUFFER_MULTIPLES: [u32; 4] = [1, 2, 4, 8];
+pub const BUFFER_MULTIPLES: [u32; 6] = [1, 2, 4, 8, 16, 32];
 /// Audio the kernel driver moves per USB transfer, which bounds the smallest buffer.
-pub const TRANSFER_MS: u32 = 4;
+pub const TRANSFER_MS: u32 = 1;
 const KEY: PCWSTR = w!("Software\\Audio Kontrol 1\\ASIO");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,12 +107,12 @@ mod tests {
     #[test]
     fn buffers_hold_a_usb_transfer_and_keep_their_length_across_rates() {
         let sizes = RATES.map(min_buffer_frames);
-        assert_eq!(sizes, [256, 256, 512, 512, 1024]);
+        assert_eq!(sizes, [64, 64, 128, 128, 256]);
         for (rate, size) in RATES.into_iter().zip(sizes) {
             assert!(size * 1000 >= rate * TRANSFER_MS);
         }
         let settings = Settings { sample_rate: 48_000, buffer_multiple: 4 };
-        assert_eq!(settings.buffer_frames(96_000), 2048);
-        assert_eq!(max_buffer_frames(192_000), 8192);
+        assert_eq!(settings.buffer_frames(96_000), 512);
+        assert_eq!(max_buffer_frames(48_000), 2048);
     }
 }

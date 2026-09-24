@@ -13,8 +13,8 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 const INSTANCE_PREFIX: &str = "USB\\VID_17CC&PID_0815\\";
 const KERNEL_SERVICE: &str = "ak1acx";
-/// Each capture transfer the driver counts covers 4 ms.
-const TRANSFER_SECONDS: f64 = 0.004;
+/// Each capture transfer the driver counts covers 1 ms.
+const TRANSFER_SECONDS: f64 = 0.001;
 
 pub enum Connection {
     Missing,

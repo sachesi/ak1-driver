@@ -24,10 +24,11 @@ use crate::rt::{qpc_frequency, qpc_now};
 use crate::usb::Ak1Usb;
 use crate::wdf::object_attributes;
 
-/// Four milliseconds of high-speed microframes (URBs need a multiple of
-/// eight). With less queued, USB passthrough in a QEMU guest loses capture
-/// packets and reports them as successful and full-sized.
-pub const PACKETS_PER_TRANSFER: usize = 32;
+/// One millisecond of high-speed microframes, the least a URB may carry,
+/// which bounds the smallest ASIO buffer. USB passthrough in a QEMU guest
+/// loses capture packets at this size and reports them as successful and
+/// full-sized; it needed 32 packets.
+pub const PACKETS_PER_TRANSFER: usize = 8;
 const TRANSFERS: usize = 16;
 const TRANSFER_BYTES: usize = PACKETS_PER_TRANSFER * MAX_PACKET_SIZE;
 const USBD_STATUS_SUCCESS: i32 = 0;
