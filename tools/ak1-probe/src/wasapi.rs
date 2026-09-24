@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE,
-    EDataFlow, IAudioCaptureClient, IAudioClient, IAudioClock, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
+    EDataFlow, IAudioCaptureClient, IAudioClient, IAudioClock, IAudioRenderClient, IConnector, IDeviceTopology,
+    IMMDevice, IMMDeviceEnumerator, IPart,
     MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eAll, eCapture, eRender,
 };
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT};
@@ -34,15 +35,59 @@ struct Open {
 }
 
 pub fn list() -> Result<()> {
+    let enumerator = device_enumerator()?;
     for (id, name, flow) in endpoints(eAll)? {
-        println!("{} {id} {name}", if flow == eRender { "render " } else { "capture" });
+        let device = unsafe { enumerator.GetDevice(&windows::core::HSTRING::from(id.as_str()))? };
+        let circuit = filter_path(&device).ok().and_then(|p| p.rsplit('\\').next().map(str::to_owned));
+        println!(
+            "{} {id} {name} [{}]",
+            if flow == eRender { "render " } else { "capture" },
+            circuit.as_deref().unwrap_or("?")
+        );
     }
     Ok(())
 }
 
-/// Plays a sine tone and reports how fast the endpoint's clock advanced.
-/// With `exclusive_rate`, the endpoint is opened exclusively at that rate.
+/// Device path of the KS filter behind an endpoint; its last component is
+/// the circuit name for this driver.
+fn filter_path(device: &IMMDevice) -> Result<String> {
+    let topology: IDeviceTopology = unsafe { device.Activate(CLSCTX_ALL, None)? };
+    let connected: IConnector = unsafe { topology.GetConnector(0)?.GetConnectedTo()? };
+    let part: IPart = windows::core::Interface::cast(&connected)?;
+    let filter = unsafe { part.GetTopologyObject()?.GetDeviceId()? };
+    let path = unsafe { filter.to_string()? };
+    unsafe { CoTaskMemFree(Some(filter.0.cast())) };
+    Ok(path)
+}
+
+/// Plays a sine tone on every channel and reports how fast the endpoint's
+/// clock advanced. With `exclusive_rate`, the endpoint is opened exclusively
+/// at that rate.
 pub fn play(endpoint: &str, seconds: f64, tone_hz: f64, exclusive_rate: Option<u32>) -> Result<()> {
+    render(endpoint, seconds, exclusive_rate, &|seconds, _channel| tone(tone_hz, seconds))
+}
+
+/// Plays a low tone on the left channel, then a high tone on the right, so a
+/// listener can tell channel order and whether samples arrive intact.
+pub fn identify(endpoint: &str) -> Result<()> {
+    println!("0-2 s: 330 Hz on the left channel; 3-5 s: 880 Hz on the right channel");
+    render(endpoint, 5.5, None, &|seconds, channel| match (channel, seconds) {
+        (0, t) if t < 2.0 => tone(330.0, t),
+        (1, t) if (3.0..5.0).contains(&t) => tone(880.0, t),
+        _ => 0.0,
+    })
+}
+
+fn tone(hz: f64, seconds: f64) -> f64 {
+    (TAU * hz * seconds).sin() * 0.25
+}
+
+fn render(
+    endpoint: &str,
+    seconds: f64,
+    exclusive_rate: Option<u32>,
+    signal: &dyn Fn(f64, usize) -> f64,
+) -> Result<()> {
     let Open { client, rate, channels, sample } = open(find(eRender, endpoint)?, exclusive_rate)?;
     let buffer_frames = unsafe { client.GetBufferSize()? };
     let render: IAudioRenderClient = unsafe { client.GetService()? };
@@ -50,23 +95,21 @@ pub fn play(endpoint: &str, seconds: f64, tone_hz: f64, exclusive_rate: Option<u
     let clock_hz = unsafe { clock.GetFrequency()? };
     println!("{rate} Hz, {channels} ch, buffer {buffer_frames} frames");
 
-    let mut phase = 0.0f64;
-    let step = TAU * tone_hz / f64::from(rate);
+    let mut written = 0u64;
     let mut fill = |frames: u32| -> Result<()> {
         if frames == 0 {
             return Ok(());
         }
         let data = unsafe { render.GetBuffer(frames)? };
         for i in 0..(frames * channels) as usize {
-            let value = phase.sin() * 0.25;
+            let frame = written + (i / channels as usize) as u64;
+            let value = signal(frame as f64 / f64::from(rate), i % channels as usize);
             match sample {
                 Sample::Float => unsafe { data.cast::<f32>().add(i).write(value as f32) },
                 Sample::Int32 => unsafe { data.cast::<i32>().add(i).write((value * f64::from(i32::MAX)) as i32) },
             }
-            if (i + 1) % channels as usize == 0 {
-                phase = (phase + step) % TAU;
-            }
         }
+        written += u64::from(frames);
         unsafe { render.ReleaseBuffer(frames, 0)? };
         Ok(())
     };
@@ -204,12 +247,18 @@ fn describe(format: *const WAVEFORMATEX) -> (u32, u32, bool) {
 
 fn find(flow: EDataFlow, needle: &str) -> Result<IMMDevice> {
     let enumerator = device_enumerator()?;
-    let matches: Vec<_> =
-        endpoints(flow)?.into_iter().filter(|(id, name, _)| id.contains(needle) || name.contains(needle)).collect();
-    match matches.as_slice() {
-        [(id, _, _)] => Ok(unsafe { enumerator.GetDevice(&windows::core::HSTRING::from(id.as_str()))? }),
-        [] => Err(format!("no active endpoint matches {needle:?}").into()),
-        _ => Err(format!("{} endpoints match {needle:?}; use more of the id", matches.len()).into()),
+    let mut matches = Vec::new();
+    for (id, name, _) in endpoints(flow)? {
+        let device = unsafe { enumerator.GetDevice(&windows::core::HSTRING::from(id.as_str()))? };
+        let circuit = filter_path(&device).unwrap_or_default().to_ascii_lowercase();
+        if id.contains(needle) || name.contains(needle) || circuit.ends_with(&format!("\\{}", needle.to_ascii_lowercase())) {
+            matches.push(device);
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(format!("no active endpoint matches {needle:?}").into()),
+        n => Err(format!("{n} endpoints match {needle:?}; use more of the id").into()),
     }
 }
 

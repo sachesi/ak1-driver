@@ -10,7 +10,7 @@ use ak1_proto::{EP_AUDIO_IN, MAX_PACKET_SIZE, Reply, SampleRate};
 use usb::{Ak1, IsochReader, Result};
 
 const USAGE: &str = "usage: ak1-probe info | capture <rate-hz> <seconds> [raw-output-file] | endpoints \
-                     | play <endpoint> <seconds> <tone-hz> [exclusive-rate-hz] \
+                     | play <endpoint> <seconds> <tone-hz> [exclusive-rate-hz] | identify <endpoint> \
                      | record <endpoint> <seconds> [exclusive-rate-hz]";
 const MICROFRAMES_PER_SECOND: u64 = 8000;
 
@@ -37,6 +37,7 @@ fn run(args: &[String]) -> Result<()> {
             capture(rate, seconds.parse()?, rest.first().map(String::as_str))
         }
         [cmd] if cmd == "endpoints" => wasapi::list(),
+        [cmd, endpoint] if cmd == "identify" => wasapi::identify(endpoint),
         [cmd, endpoint, seconds, tone, rate @ ..] if cmd == "play" && rate.len() <= 1 => {
             let rate = rate.first().map(|r| r.parse()).transpose()?;
             wasapi::play(endpoint, seconds.parse()?, tone.parse()?, rate)
