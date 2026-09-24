@@ -1,4 +1,5 @@
 [package]
 name = "ak1-proto"
 edition.workspace = true
+license.workspace = true
 version.workspace = true

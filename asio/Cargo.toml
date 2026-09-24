@@ -1,6 +1,7 @@
 [package]
 name = "ak1-asio"
 edition.workspace = true
+license.workspace = true
 version.workspace = true
 
 [lib]

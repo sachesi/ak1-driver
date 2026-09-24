@@ -4,6 +4,7 @@ members = ["asio", "crates/acx-sys", "crates/ak1-proto", "driver/ak1-acx", "tool
 
 [workspace.package]
 edition = "2024"
+license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [workspace.metadata.wdk.driver-model]

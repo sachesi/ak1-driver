@@ -1,6 +1,7 @@
 [package]
 name = "acx-sys"
 edition.workspace = true
+license.workspace = true
 version.workspace = true
 links = "acxstub"
 
