@@ -35,6 +35,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ak1-asio"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "ak1-asio-host"
+version = "0.1.0"
+dependencies = [
+ "ak1-asio",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "ak1-probe"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,9 @@
+[package]
+name = "ak1-asio-host"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+ak1-asio = { version = "0.1.0", path = "../../asio" }
+windows = { version = "0.62.2", features = ["Win32_System_Com"] }
+windows-core = "0.62.2"
