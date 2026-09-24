@@ -1,6 +1,7 @@
 //! Ties the ACX streams to the USB engine. The device has one clock, so the
 //! first stream fixes the sample rate for all others until every stream is
-//! gone, and the engine runs while any stream is prepared.
+//! gone, and the engine runs while any stream is prepared and the device is
+//! in D0.
 
 extern crate alloc;
 
@@ -101,10 +102,7 @@ impl Audio {
         let hardware = unsafe { &mut *self.hardware.get() };
         unsafe { stream.reset() };
         if hardware.engine.is_none() {
-            let (Some(usb), Some(spec)) = (hardware.usb, hardware.spec) else { return Err(STATUS_DEVICE_NOT_READY) };
-            let rate = stream.rate;
-            let engine = unsafe { Engine::start(self.device, &*usb, rate, spec.max_packet_bytes(rate), self)? };
-            hardware.engine = Some(engine);
+            unsafe { self.start_engine(hardware, stream.rate)? };
         }
         hardware.prepared += 1;
         Ok(())
@@ -115,9 +113,39 @@ impl Audio {
         let _guard = unsafe { self.lock_control() };
         let hardware = unsafe { &mut *self.hardware.get() };
         hardware.prepared = hardware.prepared.saturating_sub(1);
-        if hardware.prepared == 0
-            && let Some(engine) = hardware.engine.take()
-        {
+        if hardware.prepared == 0 {
+            unsafe { self.stop_engine(hardware) };
+        }
+    }
+
+    /// Stops streaming before the device leaves D0; prepared streams stay
+    /// prepared and `resume` starts streaming for them again.
+    pub unsafe fn suspend(&self) {
+        let _guard = unsafe { self.lock_control() };
+        unsafe { self.stop_engine(&mut *self.hardware.get()) };
+    }
+
+    pub unsafe fn resume(&self) -> Result<(), NTSTATUS> {
+        let _guard = unsafe { self.lock_control() };
+        let hardware = unsafe { &mut *self.hardware.get() };
+        let rate = unsafe { self.with_lock(|| (*self.shared.get()).rate) };
+        match rate {
+            Some(rate) if hardware.prepared > 0 && hardware.engine.is_none() => unsafe {
+                self.start_engine(hardware, rate)
+            },
+            _ => Ok(()),
+        }
+    }
+
+    unsafe fn start_engine(&self, hardware: &mut Hardware, rate: SampleRate) -> Result<(), NTSTATUS> {
+        let (Some(usb), Some(spec)) = (hardware.usb, hardware.spec) else { return Err(STATUS_DEVICE_NOT_READY) };
+        let engine = unsafe { Engine::start(self.device, &*usb, rate, spec.max_packet_bytes(rate), self)? };
+        hardware.engine = Some(engine);
+        Ok(())
+    }
+
+    unsafe fn stop_engine(&self, hardware: &mut Hardware) {
+        if let Some(engine) = hardware.engine.take() {
             unsafe { engine.stop() };
             unsafe { crate::record_stream_stats(self.device, &engine.stats) };
         }

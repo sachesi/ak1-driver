@@ -20,11 +20,11 @@ use wdk::println;
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
-    _WDF_EXECUTION_LEVEL, _WDF_SYNCHRONIZATION_SCOPE, ACCESS_MASK, KEY_SET_VALUE, NT_SUCCESS, NTSTATUS,
+    _WDF_EXECUTION_LEVEL, _WDF_POWER_DEVICE_STATE, _WDF_SYNCHRONIZATION_SCOPE, ACCESS_MASK, KEY_SET_VALUE, NT_SUCCESS, NTSTATUS,
     PCUNICODE_STRING, PDRIVER_OBJECT, PLUGPLAY_REGKEY_DEVICE, PWDFDEVICE_INIT, REG_BINARY, REG_DWORD,
     STATUS_NOT_SUPPORTED, STATUS_SUCCESS, UNICODE_STRING, WDF_DRIVER_CONFIG, WDF_NO_OBJECT_ATTRIBUTES,
     WDF_OBJECT_ATTRIBUTES, WDF_OBJECT_CONTEXT_TYPE_INFO, WDF_PNPPOWER_EVENT_CALLBACKS, WDFCMRESLIST, WDFDEVICE,
-    WDFDRIVER, WDFKEY, WDFWAITLOCK, call_unsafe_wdf_function_binding,
+    WDF_POWER_DEVICE_STATE, WDFDRIVER, WDFKEY, WDFWAITLOCK, call_unsafe_wdf_function_binding,
 };
 
 use crate::audio::Audio;
@@ -116,6 +116,8 @@ unsafe fn add_device(device_init: &mut PWDFDEVICE_INIT) -> Result<(), NTSTATUS> 
         Size: size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as u32,
         EvtDevicePrepareHardware: Some(evt_prepare_hardware),
         EvtDeviceReleaseHardware: Some(evt_release_hardware),
+        EvtDeviceD0Entry: Some(evt_d0_entry),
+        EvtDeviceD0Exit: Some(evt_d0_exit),
         ..Default::default()
     };
     unsafe {
@@ -179,6 +181,37 @@ unsafe fn prepare_hardware(device: WDFDEVICE) -> Result<(), NTSTATUS> {
         let _ = unsafe { key.assign(&FIRMWARE_VERSION_VALUE, &u32::from(spec.fw_version).to_ne_bytes(), REG_DWORD) };
     }
     Ok(())
+}
+
+extern "C" fn evt_d0_entry(device: WDFDEVICE, previous: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
+    // On first start, PrepareHardware has just set the device up.
+    if previous == _WDF_POWER_DEVICE_STATE::WdfPowerDeviceD3Final {
+        return STATUS_SUCCESS;
+    }
+    let status = into_status(unsafe { restore(device) });
+    println!("ak1acx: restore from power state {previous} status {status:#010x}");
+    if !NT_SUCCESS(status) {
+        return status;
+    }
+    let status = into_status(unsafe { (*device_context(device)).audio.resume() });
+    println!("ak1acx: resume streaming status {status:#010x}");
+    // Streams that cannot restart fail on their own; the device stays usable.
+    STATUS_SUCCESS
+}
+
+/// After system sleep the card ignores commands until its port is reset, and
+/// then needs the same setup as in PrepareHardware.
+unsafe fn restore(device: WDFDEVICE) -> Result<(), NTSTATUS> {
+    let usb = unsafe { (*device_context(device)).usb.as_mut().expect("opened in PrepareHardware") };
+    unsafe { usb.reset_port()? };
+    unsafe { usb.select_streaming()? };
+    unsafe { usb.sync()? };
+    Ok(())
+}
+
+extern "C" fn evt_d0_exit(device: WDFDEVICE, _target: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
+    unsafe { (*device_context(device)).audio.suspend() };
+    STATUS_SUCCESS
 }
 
 extern "C" fn evt_release_hardware(device: WDFDEVICE, _translated: WDFCMRESLIST) -> NTSTATUS {

@@ -19,6 +19,7 @@ const REPLY_ATTEMPTS: usize = 8;
 
 pub struct Ak1Usb {
     pub device: WDFUSBDEVICE,
+    interface: WDFUSBINTERFACE,
     pub cmd_out: WDFUSBPIPE,
     pub cmd_in: WDFUSBPIPE,
     pub audio_in: WDFUSBPIPE,
@@ -54,8 +55,21 @@ impl Ak1Usb {
                 &mut select_config
             )
         })?;
-        let interface = unsafe { select_config.Types.SingleInterface.ConfiguredUsbInterface };
+        let mut usb = Ak1Usb {
+            device: usb_device,
+            interface: unsafe { select_config.Types.SingleInterface.ConfiguredUsbInterface },
+            cmd_out: core::ptr::null_mut(),
+            cmd_in: core::ptr::null_mut(),
+            audio_in: core::ptr::null_mut(),
+            audio_out: core::ptr::null_mut(),
+        };
+        unsafe { usb.select_streaming()? };
+        Ok(usb)
+    }
 
+    /// Selects the streaming alternate setting, which replaces all pipe objects.
+    pub unsafe fn select_streaming(&mut self) -> Result<(), NTSTATUS> {
+        let interface = self.interface;
         let mut select_setting: WDF_USB_INTERFACE_SELECT_SETTING_PARAMS = unsafe { core::mem::zeroed() };
         select_setting.Size = size_of::<WDF_USB_INTERFACE_SELECT_SETTING_PARAMS>() as ULONG;
         select_setting.Type = _WdfUsbTargetDeviceSelectSettingType::WdfUsbInterfaceSelectSettingTypeSetting;
@@ -70,13 +84,15 @@ impl Ak1Usb {
         })?;
 
         let pipe = |address| unsafe { find_pipe(interface, address) };
-        Ok(Ak1Usb {
-            device: usb_device,
-            cmd_out: pipe(EP_CMD_OUT)?,
-            cmd_in: pipe(EP_CMD_IN)?,
-            audio_in: pipe(EP_AUDIO_IN)?,
-            audio_out: pipe(EP_AUDIO_OUT)?,
-        })
+        self.cmd_out = pipe(EP_CMD_OUT)?;
+        self.cmd_in = pipe(EP_CMD_IN)?;
+        self.audio_in = pipe(EP_AUDIO_IN)?;
+        self.audio_out = pipe(EP_AUDIO_OUT)?;
+        Ok(())
+    }
+
+    pub unsafe fn reset_port(&self) -> Result<(), NTSTATUS> {
+        check(unsafe { call_unsafe_wdf_function_binding!(WdfUsbTargetDeviceResetPortSynchronously, self.device) })
     }
 
     /// The firmware keeps its endpoint 1 data toggles across SET_INTERFACE and
