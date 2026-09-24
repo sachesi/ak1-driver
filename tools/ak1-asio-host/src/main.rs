@@ -13,7 +13,7 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED
 use windows_core::IUnknown;
 
 const USAGE: &str =
-    "usage: ak1-asio-host <rate-hz> <buffer-frames|pref> <seconds> [channels, e.g. in1,out3,out4] | panel";
+    "usage: ak1-asio-host <rate-hz> <buffer-frames|pref|sdk> <seconds> [channels, e.g. in1,out3,out4] | panel";
 const INPUTS: usize = 2;
 const OUTPUTS: usize = 4;
 
@@ -89,14 +89,24 @@ fn run(args: &[String]) -> Result<()> {
     unsafe { (vtbl.get_driver_name)(this.cast(), name.as_mut_ptr()) };
     let (mut inputs, mut outputs) = (0, 0);
     call(unsafe { (vtbl.get_channels)(this.cast(), &mut inputs, &mut outputs) }, "getChannels")?;
+    let (mut min, mut max, mut preferred, mut granularity) = (0, 0, 0, 0);
+    let mut get_buffer_size = || {
+        call(
+            unsafe { (vtbl.get_buffer_size)(this.cast(), &mut min, &mut max, &mut preferred, &mut granularity) },
+            "getBufferSize",
+        )
+    };
+    // The ASIO SDK's sample host reads the sizes before it sets the rate.
+    let sdk_order = frames == "sdk";
+    if sdk_order {
+        get_buffer_size()?;
+    }
     call(unsafe { (vtbl.can_sample_rate)(this.cast(), rate) }, "canSampleRate")?;
     call(unsafe { (vtbl.set_sample_rate)(this.cast(), rate) }, "setSampleRate")?;
-    let (mut min, mut max, mut preferred, mut granularity) = (0, 0, 0, 0);
-    call(
-        unsafe { (vtbl.get_buffer_size)(this.cast(), &mut min, &mut max, &mut preferred, &mut granularity) },
-        "getBufferSize",
-    )?;
-    let frames: i32 = if frames == "pref" { preferred } else { frames.parse()? };
+    if !sdk_order {
+        get_buffer_size()?;
+    }
+    let frames: i32 = if frames == "pref" || sdk_order { preferred } else { frames.parse()? };
     println!(
         "{} | {inputs} in, {outputs} out | buffer min {min} max {max} pref {preferred} gran {granularity} | using {frames}",
         c_str(&name)

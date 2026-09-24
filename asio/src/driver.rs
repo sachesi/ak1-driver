@@ -13,7 +13,7 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitFo
 use windows_core::{GUID, IUnknown, Interface};
 
 use crate::abi::*;
-use crate::duplex::{Clock, Duplex, Endpoints, Host, INPUTS, OUTPUTS, find_endpoints, request_reset};
+use crate::duplex::{Clock, Duplex, Endpoints, Host, INPUTS, OUTPUTS, find_endpoints, join_worker, request_reset};
 use crate::settings::{
     self, RATES, Settings, TRANSFER_MS, max_buffer_frames, min_buffer_frames,
 };
@@ -32,6 +32,8 @@ struct Session {
     active_inputs: [bool; INPUTS],
     active_outputs: [bool; OUTPUTS],
     running: bool,
+    /// The buffer size suits only the rate the host read the sizes at.
+    stale_size: bool,
 }
 
 struct Driver {
@@ -42,6 +44,8 @@ struct Driver {
     endpoints: Option<Endpoints>,
     error: String,
     rate: u32,
+    /// The rate the host last read the buffer sizes at.
+    listed_rate: Option<u32>,
     session: Option<Session>,
 }
 
@@ -77,6 +81,7 @@ impl AsioObject {
                 endpoints: None,
                 error: String::new(),
                 rate: Settings::load().sample_rate,
+                listed_rate: None,
                 session: None,
             }),
             clock: Arc::new(Clock::default()),
@@ -279,6 +284,11 @@ unsafe extern "system" fn start(this: *mut AsioObject) -> AsioError {
     match session.duplex.start(session.host.clone(), object.clock.clone()) {
         Ok(()) => {
             session.running = true;
+            if std::mem::take(&mut session.stale_size) {
+                let callbacks = session.host.callbacks;
+                drop(driver);
+                request_reset(&callbacks);
+            }
             ASE_OK
         }
         Err(e) => driver.fail(ASE_HW_MALFUNCTION, format!("starting streams failed: {e}")),
@@ -286,12 +296,21 @@ unsafe extern "system" fn start(this: *mut AsioObject) -> AsioError {
 }
 
 unsafe extern "system" fn stop(this: *mut AsioObject) -> AsioError {
-    let mut driver = unsafe { (*this).driver() };
-    if let Some(session) = driver.session.as_mut()
-        && session.running
-    {
-        session.duplex.stop();
-        session.running = false;
+    let object = unsafe { &*this };
+    let thread = match object.driver().session.as_mut() {
+        Some(session) if session.running => {
+            session.running = false;
+            session.duplex.signal_stop()
+        }
+        _ => return ASE_OK,
+    };
+    // The streaming thread may be in a host callback that calls back into the
+    // driver, so it has to end without the driver locked.
+    if let Some(thread) = thread {
+        join_worker(thread);
+    }
+    if let Some(session) = object.driver().session.as_ref() {
+        session.duplex.stop_streams();
     }
     ASE_OK
 }
@@ -325,7 +344,11 @@ unsafe extern "system" fn get_buffer_size(
     preferred: *mut i32,
     granularity: *mut i32,
 ) -> AsioError {
-    let rate = unsafe { (*this).driver() }.rate;
+    let rate = {
+        let mut driver = unsafe { (*this).driver() };
+        driver.listed_rate = Some(driver.rate);
+        driver.rate
+    };
     unsafe {
         *min = min_buffer_frames(rate) as i32;
         *max = max_buffer_frames(rate) as i32;
@@ -357,7 +380,7 @@ unsafe extern "system" fn set_sample_rate(this: *mut AsioObject, rate: f64) -> A
         let callbacks = session.host.callbacks;
         driver.rate = rate;
         drop(driver);
-        unsafe { (callbacks.asio_message)(K_ASIO_RESET_REQUEST, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+        request_reset(&callbacks);
         return ASE_OK;
     }
     driver.rate = rate;
@@ -436,9 +459,13 @@ unsafe extern "system" fn create_buffers(
         return driver.fail(ASE_NOT_PRESENT, "driver not initialized");
     };
     let rate = driver.rate;
-    // Some hosts list the sizes once, at the rate the driver had then, and
-    // may pair one with another rate. Longer buffers work at any rate.
-    let (min, max) = (min_buffer_frames(rate) as i32, max_buffer_frames(RATES[RATES.len() - 1]) as i32);
+    // Some hosts read the sizes before they set the rate and then ask for one
+    // that suits only the rate they read them at. Such a size is accepted and
+    // the host asked to read the sizes again once streaming. Longer buffers
+    // work at any rate.
+    let rate_min = min_buffer_frames(rate) as i32;
+    let listed_min = driver.listed_rate.map_or(rate_min, |listed| min_buffer_frames(listed) as i32);
+    let (min, max) = (rate_min.min(listed_min), max_buffer_frames(RATES[RATES.len() - 1]) as i32);
     if infos.is_null() || callbacks.is_null() || channels <= 0 || buffer_size < min || buffer_size > max {
         return driver.fail(
             ASE_INVALID_PARAMETER,
@@ -495,7 +522,8 @@ unsafe extern "system" fn create_buffers(
         }
         Err(e) => return driver.fail(ASE_HW_MALFUNCTION, format!("opening the device at {rate} Hz failed: {e}")),
     };
-    driver.session = Some(Session { duplex, buffers, host, active_inputs, active_outputs, running: false });
+    let stale_size = buffer_size < rate_min;
+    driver.session = Some(Session { duplex, buffers, host, active_inputs, active_outputs, running: false, stale_size });
     ASE_OK
 }
 

@@ -18,7 +18,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::Media::timeGetTime;
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, ResetEvent, SetEvent,
     WaitForMultipleObjects,
@@ -26,6 +26,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{Interface, Result, w};
 
 use crate::abi::{K_ASIO_RESET_REQUEST, K_ASIO_SELECTOR_SUPPORTED};
+use crate::settings::min_buffer_frames;
 
 pub const INPUTS: usize = 2;
 pub const OUTPUTS: usize = 4;
@@ -185,7 +186,11 @@ unsafe impl Send for Duplex {}
 impl Duplex {
     /// Opens the endpoints that carry the channels `host` uses.
     pub fn open(endpoints: &Endpoints, host: &Host) -> Result<Duplex> {
-        let (rate, frames) = (host.rate, host.buffer_frames as u32);
+        // Windows refuses periods that are too short for the device; a host
+        // buffer shorter than the smallest one at this rate then switches
+        // more than once per period.
+        let rate = host.rate;
+        let frames = (host.buffer_frames as u32).max(min_buffer_frames(rate));
         let open = |device: &IMMDevice, used: bool| used.then(|| open_stream(device, rate, frames)).transpose();
         Ok(Duplex {
             renders: [
@@ -223,17 +228,25 @@ impl Duplex {
         let worker = Worker { capture, renders, events, sources, host, clock };
         unsafe { ResetEvent(self.stop)? };
         for stream in self.streams() {
-            unsafe { stream.client.Start()? };
+            if let Err(e) = unsafe { stream.client.Start() } {
+                // Streams left running would hold the device clock at this rate.
+                self.stop_streams();
+                return Err(e);
+            }
         }
         self.thread = Some(std::thread::spawn(move || worker.run()));
         Ok(())
     }
 
-    pub fn stop(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            let _ = unsafe { SetEvent(self.stop) };
-            let _ = thread.join();
-        }
+    /// Tells the streaming thread to end and hands it over, so that the
+    /// caller can wait for it without holding locks the host's callbacks may need.
+    pub fn signal_stop(&mut self) -> Option<JoinHandle<()>> {
+        let thread = self.thread.take()?;
+        let _ = unsafe { SetEvent(self.stop) };
+        Some(thread)
+    }
+
+    pub fn stop_streams(&self) {
         for stream in self.streams() {
             let _ = unsafe { stream.client.Stop() };
             let _ = unsafe { stream.client.Reset() };
@@ -243,8 +256,19 @@ impl Duplex {
 
 impl Drop for Duplex {
     fn drop(&mut self) {
-        self.stop();
+        if let Some(thread) = self.signal_stop() {
+            join_worker(thread);
+        }
+        self.stop_streams();
         let _ = unsafe { CloseHandle(self.stop) };
+    }
+}
+
+/// Waits for the streaming thread to end, unless this is that thread: a host
+/// may stop the driver from a callback the thread is making.
+pub fn join_worker(thread: JoinHandle<()>) {
+    if thread.thread().id() != std::thread::current().id() {
+        let _ = thread.join();
     }
 }
 
@@ -284,9 +308,9 @@ unsafe impl Send for Worker {}
 struct State {
     captured: VecDeque<[i32; 2]>,
     outputs: [VecDeque<[i32; 2]>; 2],
+    output_limits: [usize; 2],
     index: usize,
     position: u64,
-    qpc_hz: i64,
 }
 
 impl Worker {
@@ -294,14 +318,19 @@ impl Worker {
         let mut task_index = 0;
         let task = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) };
         let frames = self.host.buffer_frames;
+        // A render period longer than the host buffer takes more than one
+        // buffer switch to fill, so its FIFO starts that much fuller.
+        let prefill = self.renders.each_ref().map(|render| {
+            let period = render.as_ref().map_or(0, |r| r.frames as usize);
+            if period > frames { period + frames } else { frames }
+        });
         let mut state = State {
             captured: VecDeque::with_capacity(8 * frames),
-            outputs: std::array::from_fn(|_| VecDeque::from(vec![[0; 2]; frames])),
+            outputs: prefill.map(|len| VecDeque::from(vec![[0; 2]; len])),
+            output_limits: prefill.map(|len| len + 3 * frames),
             index: 0,
             position: 0,
-            qpc_hz: 0,
         };
-        let _ = unsafe { QueryPerformanceFrequency(&mut state.qpc_hz) };
         // Without inputs, the first render endpoint paces the buffer switches.
         let pacing_render = if self.capture.is_some() { None } else { self.renders.iter().position(Option::is_some) };
 
@@ -359,9 +388,8 @@ impl Worker {
     fn switch(&self, state: &mut State) {
         let frames = self.host.buffer_frames;
         let index = state.index;
-        let mut qpc = 0;
-        let _ = unsafe { QueryPerformanceCounter(&mut qpc) };
-        let now_ns = (qpc as u128 * 1_000_000_000 / state.qpc_hz as u128) as u64;
+        // The ASIO specification requires timeGetTime as the source of system time.
+        let now_ns = u64::from(unsafe { timeGetTime() }) * 1_000_000;
         self.clock.sample_position.store(state.position, Ordering::Release);
         self.clock.system_time_ns.store(now_ns, Ordering::Release);
 
@@ -400,7 +428,7 @@ impl Worker {
                 };
                 fifo.push_back([sample(2 * pair), sample(2 * pair + 1)]);
             }
-            let excess = fifo.len().saturating_sub(4 * frames);
+            let excess = fifo.len().saturating_sub(state.output_limits[pair]);
             fifo.drain(..excess);
         }
         state.position += frames as u64;
