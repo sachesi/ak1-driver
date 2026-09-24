@@ -2,10 +2,11 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Installs or removes the Audio Kontrol 1 driver and ASIO driver from a bundle
-    made by make-bundle.ps1. Run it from the bundle directory.
+    Installs or removes the Audio Kontrol 1 driver, ASIO driver and control
+    panel from a bundle made by make-bundle.ps1. Run it from the bundle directory.
 .PARAMETER Uninstall
-    Remove the ASIO registration, the driver package and the installed files.
+    Remove the ASIO registration, the driver package, the installed files and
+    the Start menu shortcut.
 #>
 param([switch] $Uninstall)
 
@@ -13,6 +14,8 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $asioDir = Join-Path $env:ProgramFiles 'Audio Kontrol 1'
 $asioDll = Join-Path $asioDir 'ak1_asio.dll'
+$panel = Join-Path $asioDir 'ak1-panel.exe'
+$shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Audio Kontrol 1 Control Panel.lnk'
 
 # regsvr32 is a GUI program; the call operator would not wait for it.
 function Invoke-Regsvr32([string[]] $Arguments) {
@@ -20,6 +23,7 @@ function Invoke-Regsvr32([string[]] $Arguments) {
 }
 
 if ($Uninstall) {
+    Remove-Item $shortcut -ErrorAction Ignore
     if (Test-Path $asioDll) {
         Invoke-Regsvr32 '/s', '/u', "`"$asioDll`"" | Out-Null
         Remove-Item $asioDir -Recurse -Force
@@ -48,7 +52,12 @@ if ($LASTEXITCODE -notin 0, 259, 3010) { throw "pnputil failed with exit code $L
 
 New-Item -ItemType Directory -Force $asioDir | Out-Null
 Copy-Item (Join-Path $here 'ak1_asio.dll') $asioDll -Force
+Copy-Item (Join-Path $here 'ak1-panel.exe') $panel -Force
 $exitCode = Invoke-Regsvr32 '/s', "`"$asioDll`""
 if ($exitCode) { throw "registering $asioDll failed with exit code $exitCode" }
+
+$link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+$link.TargetPath = $panel
+$link.Save()
 
 Write-Output 'installed; replug the Audio Kontrol 1 if it does not show up'
