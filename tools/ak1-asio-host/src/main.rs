@@ -12,7 +12,7 @@ use ak1_asio::abi::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
 use windows_core::IUnknown;
 
-const USAGE: &str = "usage: ak1-asio-host <rate-hz> <buffer-frames|pref> <seconds>";
+const USAGE: &str = "usage: ak1-asio-host <rate-hz> <buffer-frames|pref> <seconds> [channels, e.g. in1,out3,out4]";
 const INPUTS: usize = 2;
 const OUTPUTS: usize = 4;
 
@@ -36,6 +36,7 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 static LAST_POSITION: AtomicU64 = AtomicU64::new(0);
 static POSITION_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static RESET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,7 +50,11 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<()> {
-    let [rate, frames, seconds] = args else { return Err(USAGE.into()) };
+    let (rate, frames, seconds, channels) = match args {
+        [rate, frames, seconds] => (rate, frames, seconds, None),
+        [rate, frames, seconds, channels] => (rate, frames, seconds, Some(channels.as_str())),
+        _ => return Err(USAGE.into()),
+    };
     let rate: f64 = rate.parse()?;
     let seconds: f64 = seconds.parse()?;
 
@@ -82,9 +87,12 @@ fn run(args: &[String]) -> Result<()> {
         c_str(&name)
     );
 
-    let mut infos: Vec<AsioBufferInfo> = (0..INPUTS)
-        .map(|c| (1, c))
-        .chain((0..OUTPUTS).map(|c| (0, c)))
+    let selected: Vec<(i32, usize)> = match channels {
+        None => (0..INPUTS).map(|c| (1, c)).chain((0..OUTPUTS).map(|c| (0, c))).collect(),
+        Some(list) => list.split(',').map(parse_channel).collect::<Result<_>>()?,
+    };
+    let mut infos: Vec<AsioBufferInfo> = selected
+        .into_iter()
         .map(|(is_input, channel)| AsioBufferInfo {
             is_input,
             channel_num: channel as i32,
@@ -128,16 +136,32 @@ fn run(args: &[String]) -> Result<()> {
     let expected = elapsed * rate / f64::from(frames);
     println!(
         "switches {switches} (expected ~{expected:.0}), worst gap {:.2} ms (period {:.2} ms), position {}, \
-         position errors {}, input peak {:.1} dBFS",
+         position errors {}, input peak {:.1} dBFS, reset requests {}",
         session.worst_gap.as_secs_f64() * 1e3,
         f64::from(frames) / rate * 1e3,
         u64::from(position),
         POSITION_ERRORS.load(Ordering::Acquire),
         20.0 * session.peak.max(1e-9).log10(),
+        RESET_REQUESTS.load(Ordering::Acquire),
     );
     drop(driver);
     drop(unknown);
     Ok(())
+}
+
+/// `in1`..`in2` or `out1`..`out4`, as (is_input, zero-based channel).
+fn parse_channel(name: &str) -> Result<(i32, usize)> {
+    let (is_input, number, count) = if let Some(n) = name.strip_prefix("in") {
+        (1, n, INPUTS)
+    } else if let Some(n) = name.strip_prefix("out") {
+        (0, n, OUTPUTS)
+    } else {
+        return Err(format!("unknown channel {name}").into());
+    };
+    match number.parse::<usize>() {
+        Ok(n) if (1..=count).contains(&n) => Ok((is_input, n - 1)),
+        _ => Err(format!("unknown channel {name}").into()),
+    }
 }
 
 fn message(this: Driver) -> String {
@@ -196,8 +220,14 @@ unsafe extern "C" fn sample_rate_did_change(_rate: f64) {}
 
 unsafe extern "C" fn asio_message(selector: i32, value: i32, _message: *mut c_void, _opt: *mut f64) -> i32 {
     match selector {
-        K_ASIO_SELECTOR_SUPPORTED => i32::from(matches!(value, K_ASIO_ENGINE_VERSION | K_ASIO_SUPPORTS_TIME_INFO)),
+        K_ASIO_SELECTOR_SUPPORTED => {
+            i32::from(matches!(value, K_ASIO_ENGINE_VERSION | K_ASIO_SUPPORTS_TIME_INFO | K_ASIO_RESET_REQUEST))
+        }
         K_ASIO_ENGINE_VERSION => 2,
+        K_ASIO_RESET_REQUEST => {
+            RESET_REQUESTS.fetch_add(1, Ordering::AcqRel);
+            1
+        }
         K_ASIO_SUPPORTS_TIME_INFO => 1,
         _ => 0,
     }
