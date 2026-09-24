@@ -155,7 +155,7 @@ pub struct IAsioVtbl<T> {
 }
 
 /// Copies `text` into a host-provided, NUL-terminated C string of `capacity` bytes.
-pub unsafe fn write_c_string(out: *mut u8, capacity: usize, text: &str) {
+pub(crate) unsafe fn write_c_string(out: *mut u8, capacity: usize, text: &str) {
     let len = text.len().min(capacity - 1);
     unsafe {
         std::ptr::copy_nonoverlapping(text.as_ptr(), out, len);

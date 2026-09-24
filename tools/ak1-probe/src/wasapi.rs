@@ -237,11 +237,7 @@ fn open(device: IMMDevice, exclusive_rate: Option<u32>) -> Result<Open> {
 
 fn describe(format: *const WAVEFORMATEX) -> (u32, u32, bool) {
     let f = unsafe { format.read_unaligned() };
-    let sub_format = || {
-        let ext = unsafe { format.cast::<WAVEFORMATEXTENSIBLE>().read_unaligned() };
-        let sub_format = ext.SubFormat;
-        sub_format
-    };
+    let sub_format = || unsafe { format.cast::<WAVEFORMATEXTENSIBLE>().read_unaligned() }.SubFormat;
     let float = f.wFormatTag == WAVE_FORMAT_IEEE_FLOAT as u16
         || (f.wFormatTag == WAVE_FORMAT_EXTENSIBLE && sub_format() == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
     (f.nSamplesPerSec, u32::from(f.nChannels), float && f.wBitsPerSample == 32)

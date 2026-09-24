@@ -256,7 +256,7 @@ impl Engine {
                     // Some hosts report lost packets as successful and full-sized.
                     let valid = packet.Status == USBD_STATUS_SUCCESS
                         && received <= self.max_packet_bytes
-                        && received % mode2::FRAME_BYTES == 0;
+                        && received.is_multiple_of(mode2::FRAME_BYTES);
                     let len = if valid { received } else { 0 };
                     if !valid {
                         self.stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
@@ -388,7 +388,7 @@ impl Transfer {
     /// Fills in the URB fields shared by both directions; the header was set
     /// up by the framework and must not be cleared.
     unsafe fn prepare_urb(&self, pipe: WDFUSBPIPE, direction: u32, length: usize) -> *mut URB {
-        let iso = unsafe { &mut *(&raw mut (*self.urb).__bindgen_anon_1.UrbIsochronousTransfer) };
+        let iso = unsafe { &mut (*self.urb).__bindgen_anon_1.UrbIsochronousTransfer };
         iso.Hdr.Length = iso_urb_size(PACKETS_PER_TRANSFER) as u16;
         iso.Hdr.Function = URB_FUNCTION_ISOCH_TRANSFER as u16;
         iso.PipeHandle = unsafe { call_unsafe_wdf_function_binding!(WdfUsbTargetPipeWdmGetPipeHandle, pipe) };

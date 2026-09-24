@@ -162,7 +162,7 @@ impl RtStream {
     }
 
     unsafe fn allocate_packets(&self, count: usize, packet_bytes: usize) -> Result<PACX_RTPACKET, NTSTATUS> {
-        if count == 0 || count > MAX_PACKETS || packet_bytes == 0 || packet_bytes % self.block_align() != 0 {
+        if count == 0 || count > MAX_PACKETS || packet_bytes == 0 || !packet_bytes.is_multiple_of(self.block_align()) {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let packets = unsafe { pool_alloc(count * size_of::<ACX_RTPACKET>()) }.cast::<ACX_RTPACKET>();

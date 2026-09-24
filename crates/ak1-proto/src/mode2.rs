@@ -43,7 +43,7 @@ pub fn frames_in(packet_len: usize) -> usize {
 /// Decodes whole frames of a capture packet; trailing partial frames are ignored.
 pub fn decode_capture(packet: &[u8], mut frame: impl FnMut(Frame)) -> CaptureStatus {
     let mut status = CaptureStatus::default();
-    for (index, bytes) in packet.chunks_exact(FRAME_BYTES).enumerate() {
+    for (index, bytes) in packet.as_chunks::<FRAME_BYTES>().0.iter().enumerate() {
         let (right, left) = bytes.split_at(BLOCK_BYTES);
         let mut samples = [0; CHANNELS];
         for (block_in_frame, block) in [left, right].into_iter().enumerate() {
@@ -73,9 +73,9 @@ pub struct PlaybackEncoder {
 impl PlaybackEncoder {
     /// Fills `packet` (a whole number of frames) with samples from `next_frame`.
     pub fn encode(&mut self, packet: &mut [u8], mut next_frame: impl FnMut() -> Frame) {
-        for (index, bytes) in packet.chunks_exact_mut(FRAME_BYTES).enumerate() {
+        for (index, bytes) in packet.as_chunks_mut::<FRAME_BYTES>().0.iter_mut().enumerate() {
             let samples = next_frame();
-            for (block_in_frame, block) in bytes.chunks_exact_mut(BLOCK_BYTES).enumerate() {
+            for (block_in_frame, block) in bytes.as_chunks_mut::<BLOCK_BYTES>().0.iter_mut().enumerate() {
                 let block_index = 2 * index + block_in_frame;
                 for stream in 0..STREAMS {
                     let [b0, b1, b2] = to_be24(samples[stream * CHANNELS_PER_STREAM + block_in_frame]);
@@ -92,7 +92,7 @@ impl PlaybackEncoder {
 }
 
 fn check_byte(stream: usize, block_index: usize) -> u8 {
-    ((stream as u8) << 1) | u8::from(block_index % 2 == 0)
+    ((stream as u8) << 1) | u8::from(block_index.is_multiple_of(2))
 }
 
 fn from_be24([b0, b1, b2]: [u8; 3]) -> i32 {
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn capture_even_block_is_right_channel() {
         let mut packet = [0; 2 * FRAME_BYTES];
-        for (i, block) in packet.chunks_exact_mut(BLOCK_BYTES).enumerate() {
+        for (i, block) in packet.as_chunks_mut::<BLOCK_BYTES>().0.iter_mut().enumerate() {
             let value = i as i32 + 1;
             block.copy_from_slice(&capture_block(i, [value, -value], false));
         }

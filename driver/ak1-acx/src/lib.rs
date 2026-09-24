@@ -68,6 +68,9 @@ static STREAM_CONTEXT_TYPE: ContextTypeInfo = ContextTypeInfo(WDF_OBJECT_CONTEXT
 static FIRMWARE_VERSION_VALUE: [u16; 15] = utf16(b"FirmwareVersion");
 static STREAM_STATS_VALUE: [u16; 11] = utf16(b"StreamStats");
 
+/// # Safety
+///
+/// Called only by the I/O manager, with its driver object and registry path.
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "system" fn driver_entry(driver: PDRIVER_OBJECT, registry_path: PCUNICODE_STRING) -> NTSTATUS {
     let mut config = WDF_DRIVER_CONFIG {

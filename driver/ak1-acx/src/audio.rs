@@ -115,11 +115,11 @@ impl Audio {
         let _guard = unsafe { self.lock_control() };
         let hardware = unsafe { &mut *self.hardware.get() };
         hardware.prepared = hardware.prepared.saturating_sub(1);
-        if hardware.prepared == 0 {
-            if let Some(engine) = hardware.engine.take() {
-                unsafe { engine.stop() };
-                unsafe { crate::record_stream_stats(self.device, &engine.stats) };
-            }
+        if hardware.prepared == 0
+            && let Some(engine) = hardware.engine.take()
+        {
+            unsafe { engine.stop() };
+            unsafe { crate::record_stream_stats(self.device, &engine.stats) };
         }
     }
 
