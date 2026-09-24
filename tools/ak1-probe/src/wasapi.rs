@@ -106,7 +106,8 @@ pub fn record(endpoint: &str, seconds: f64, exclusive_rate: Option<u32>) -> Resu
     println!("{rate} Hz, {channels} ch");
     unsafe { client.Start()? };
     let start = Instant::now();
-    let (mut frames, mut discontinuities, mut peak) = (0u64, 0u32, 0f64);
+    let (mut frames, mut discontinuities, mut peak, mut startup_peak) = (0u64, 0u32, 0f64, 0f64);
+    let startup_frames = u64::from(rate) / 2;
     while start.elapsed().as_secs_f64() < seconds {
         std::thread::sleep(Duration::from_millis(2));
         loop {
@@ -124,7 +125,9 @@ pub fn record(endpoint: &str, seconds: f64, exclusive_rate: Option<u32>) -> Resu
                     Sample::Float => f64::from(unsafe { data.cast::<f32>().add(i).read() }),
                     Sample::Int32 => f64::from(unsafe { data.cast::<i32>().add(i).read() }) / f64::from(i32::MAX),
                 };
-                peak = peak.max(value.abs());
+                let frame = frames + (i / channels as usize) as u64;
+                let slot = if frame < startup_frames { &mut startup_peak } else { &mut peak };
+                *slot = slot.max(value.abs());
             }
             frames += u64::from(count);
             unsafe { capture.ReleaseBuffer(count)? };
@@ -132,10 +135,13 @@ pub fn record(endpoint: &str, seconds: f64, exclusive_rate: Option<u32>) -> Resu
     }
     let elapsed = start.elapsed().as_secs_f64();
     unsafe { client.Stop()? };
+    let dbfs = |peak: f64| 20.0 * peak.max(1e-9).log10();
     println!(
-        "frames {frames} in {elapsed:.2} s = {:.1} frames/s, discontinuities {discontinuities}, peak {:.1} dBFS",
+        "frames {frames} in {elapsed:.2} s = {:.1} frames/s, discontinuities {discontinuities}, \
+         peak {:.1} dBFS in the first 0.5 s, {:.1} dBFS after",
         frames as f64 / elapsed,
-        20.0 * peak.max(1e-9).log10()
+        dbfs(startup_peak),
+        dbfs(peak)
     );
     Ok(())
 }
