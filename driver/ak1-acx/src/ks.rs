@@ -1,7 +1,7 @@
 //! Kernel-streaming GUIDs and wave format layouts used by the audio circuits.
 //! The GUIDs are defined here because the headers only declare them.
 
-use wdk_sys::GUID;
+use wdk_sys::{DEVPROPKEY, GUID};
 
 const fn guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> GUID {
     GUID { Data1: data1, Data2: data2, Data3: data3, Data4: data4 }
@@ -44,6 +44,46 @@ pub struct KsWaveFormat {
 }
 
 const _: () = assert!(size_of::<KsWaveFormat>() == 104);
+
+pub const DEVPKEY_KSAUDIO_PACKETSIZE_CONSTRAINTS2: DEVPROPKEY = DEVPROPKEY {
+    fmtid: guid(0x9404f781, 0x7191, 0x409b, [0x8b, 0x0b, 0x80, 0xbf, 0x6e, 0xc2, 0x29, 0xae]),
+    pid: 2,
+};
+const AUDIO_SIGNALPROCESSINGMODE_DEFAULT: GUID =
+    guid(0xc18e2f7e, 0x933d, 0x4965, [0xb7, 0xd1, 0x1e, 0xef, 0x22, 0x8d, 0x2a, 0xf3]);
+const AUDIO_SIGNALPROCESSINGMODE_RAW: GUID =
+    guid(0x9e90ea20, 0xb493, 0x4fd1, [0xa1, 0xa8, 0x7e, 0x13, 0x61, 0xa9, 0x56, 0xcf]);
+const HNS_PER_MS: u32 = 10_000;
+
+/// `KSAUDIO_PACKETSIZE_CONSTRAINTS2` with one entry per processing mode.
+#[repr(C)]
+pub struct PacketSizeConstraints {
+    min_packet_period_hns: u32,
+    packet_size_file_alignment: u32,
+    max_packet_size_bytes: u32,
+    mode_count: u32,
+    modes: [ModeConstraint; 2],
+}
+
+#[repr(C)]
+struct ModeConstraint {
+    mode: GUID,
+    samples_per_packet: u32,
+    packet_duration_hns: u32,
+}
+
+/// Lets exclusive-mode clients use periods down to one USB transfer instead
+/// of the default of about 3 ms.
+pub static PACKET_SIZE_CONSTRAINTS: PacketSizeConstraints = PacketSizeConstraints {
+    min_packet_period_hns: HNS_PER_MS,
+    packet_size_file_alignment: 0,
+    max_packet_size_bytes: 0,
+    mode_count: 2,
+    modes: [
+        ModeConstraint { mode: AUDIO_SIGNALPROCESSINGMODE_RAW, samples_per_packet: 0, packet_duration_hns: HNS_PER_MS },
+        ModeConstraint { mode: AUDIO_SIGNALPROCESSINGMODE_DEFAULT, samples_per_packet: 0, packet_duration_hns: HNS_PER_MS },
+    ],
+};
 
 impl KsWaveFormat {
     /// Interleaved stereo integer PCM in `container_bits`-bit samples.

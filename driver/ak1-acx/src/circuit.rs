@@ -7,14 +7,23 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use acx_sys::{
-    _ACX_CIRCUIT_TYPE, _ACX_PIN_COMMUNICATION, _ACX_PIN_TYPE, ACX_DATAFORMAT_CONFIG, ACX_PIN_CONFIG,
-    ACX_RT_STREAM_CALLBACKS, ACX_STREAM_CALLBACKS, ACXCIRCUIT, ACXDATAFORMAT, ACXOBJECTBAG, ACXPIN, ACXSTREAM,
-    PACXCIRCUIT_INIT, PACXSTREAM_INIT, call_acx,
+    _ACX_CIRCUIT_TYPE, _ACX_PIN_COMMUNICATION, _ACX_PIN_TYPE, ACX_CIRCUIT_PNPPOWER_CALLBACKS, ACX_DATAFORMAT_CONFIG,
+    ACX_PIN_CONFIG, ACX_RT_STREAM_CALLBACKS, ACX_STREAM_CALLBACKS, ACXCIRCUIT, ACXDATAFORMAT, ACXOBJECTBAG, ACXPIN,
+    ACXSTREAM, PACXCIRCUIT_INIT, PACXSTREAM_INIT, call_acx,
 };
 use ak1_proto::SampleRate;
-use wdk_sys::{GUID, NT_SUCCESS, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_NOT_SUPPORTED, WDF_OBJECT_ATTRIBUTES, WDFDEVICE};
+use wdk::println;
+use wdk_sys::ntddk::{IoGetDeviceInterfaceAlias, IoSetDeviceInterfacePropertyData, RtlFreeUnicodeString};
+use wdk_sys::{
+    DEVPROP_TYPE_BINARY, GUID, NT_SUCCESS, NTSTATUS, PLUGPLAY_PROPERTY_PERSISTENT, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_DEVICE_STATE, STATUS_NOT_SUPPORTED, STATUS_SUCCESS, UNICODE_STRING, WDF_OBJECT_ATTRIBUTES,
+    WDF_POWER_DEVICE_STATE, WDFDEVICE, call_unsafe_wdf_function_binding,
+};
 
-use crate::ks::{KSCATEGORY_AUDIO, KSNODETYPE_LINE_CONNECTOR, KsWaveFormat};
+use crate::ks::{
+    DEVPKEY_KSAUDIO_PACKETSIZE_CONSTRAINTS2, KSCATEGORY_AUDIO, KSNODETYPE_LINE_CONNECTOR, KsWaveFormat,
+    PACKET_SIZE_CONSTRAINTS,
+};
 use crate::rt::{self, RtStream, Slot};
 use crate::wdf::object_attributes;
 use crate::{STREAM_CONTEXT_TYPE, device_context, unicode, utf16};
@@ -23,6 +32,7 @@ const HOST_PIN: u32 = 0;
 const BRIDGE_PIN: u32 = 1;
 const ACX_PIN_ID_DEFAULT: u32 = u32::MAX;
 const ACX_INSTANCE_INDETERMINATE: u32 = u32::MAX;
+const LOCALE_NEUTRAL: u32 = 0;
 
 /// Default format first: 48 kHz with 24 valid bits.
 const FORMATS: [(SampleRate, u16, u16); 10] = [
@@ -104,6 +114,10 @@ unsafe fn create_from_init(
         call_acx!(AcxCircuitInitSetCircuitType, *init, circuit_type);
         check(call_acx!(AcxCircuitInitAssignAcxCreateStreamCallback, *init, Some(evt_create_stream)))?;
     }
+    let mut power: ACX_CIRCUIT_PNPPOWER_CALLBACKS = unsafe { core::mem::zeroed() };
+    power.Size = size_of::<ACX_CIRCUIT_PNPPOWER_CALLBACKS>() as u32;
+    power.EvtAcxCircuitPowerUp = Some(evt_power_up);
+    unsafe { call_acx!(AcxCircuitInitSetAcxCircuitPnpPowerCallbacks, *init, &mut power) };
     let mut attributes = object_attributes(core::ptr::null_mut());
     let mut circuit: ACXCIRCUIT = core::ptr::null_mut();
     check(unsafe { call_acx!(AcxCircuitCreate, device, &mut attributes, init, &mut circuit) })?;
@@ -148,6 +162,41 @@ unsafe fn add_formats(device: WDFDEVICE, circuit: ACXCIRCUIT, pin: ACXPIN) -> Re
         check(unsafe { call_acx!(AcxDataFormatListAddDataFormat, list, format) })?;
     }
     Ok(())
+}
+
+/// The circuit's audio interface exists from here on, so its properties can be set.
+unsafe extern "C" fn evt_power_up(_device: WDFDEVICE, circuit: ACXCIRCUIT, _previous: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
+    let status = match unsafe { set_packet_size_constraints(circuit) } {
+        Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
+    };
+    println!("ak1acx: packet size constraints status {status:#010x}");
+    // Streaming still works without them, only with longer periods.
+    STATUS_SUCCESS
+}
+
+unsafe fn set_packet_size_constraints(circuit: ACXCIRCUIT) -> Result<(), NTSTATUS> {
+    let link = unsafe { call_acx!(AcxCircuitGetSymbolicLinkName, circuit) };
+    let mut link_name = UNICODE_STRING::default();
+    unsafe { call_unsafe_wdf_function_binding!(WdfStringGetUnicodeString, link, &mut link_name) };
+    if link_name.Length == 0 {
+        return Err(STATUS_INVALID_DEVICE_STATE);
+    }
+    let mut alias = UNICODE_STRING::default();
+    check(unsafe { IoGetDeviceInterfaceAlias(&mut link_name, &KSCATEGORY_AUDIO, &mut alias) })?;
+    let status = unsafe {
+        IoSetDeviceInterfacePropertyData(
+            &mut alias,
+            &DEVPKEY_KSAUDIO_PACKETSIZE_CONSTRAINTS2,
+            LOCALE_NEUTRAL,
+            PLUGPLAY_PROPERTY_PERSISTENT,
+            DEVPROP_TYPE_BINARY,
+            size_of_val(&PACKET_SIZE_CONSTRAINTS) as u32,
+            (&raw const PACKET_SIZE_CONSTRAINTS).cast_mut().cast(),
+        )
+    };
+    unsafe { RtlFreeUnicodeString(&mut alias) };
+    check(status)
 }
 
 unsafe extern "C" fn evt_create_stream(
