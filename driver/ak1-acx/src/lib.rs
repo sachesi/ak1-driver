@@ -175,8 +175,10 @@ unsafe fn prepare_hardware(device: WDFDEVICE) -> Result<(), NTSTATUS> {
         context.circuits_added = true;
     }
 
-    let key = unsafe { DeviceKey::open(device, KEY_SET_VALUE)? };
-    unsafe { key.assign(&FIRMWARE_VERSION_VALUE, &u32::from(spec.fw_version).to_ne_bytes(), REG_DWORD) }
+    if let Ok(key) = unsafe { DeviceKey::open(device, KEY_SET_VALUE) } {
+        let _ = unsafe { key.assign(&FIRMWARE_VERSION_VALUE, &u32::from(spec.fw_version).to_ne_bytes(), REG_DWORD) };
+    }
+    Ok(())
 }
 
 extern "C" fn evt_release_hardware(device: WDFDEVICE, _translated: WDFCMRESLIST) -> NTSTATUS {
