@@ -423,11 +423,14 @@ unsafe extern "C" fn capture_complete(
         engine.stats.capture_transfers.fetch_add(1, Ordering::Relaxed);
         if engine.running.load(Ordering::Acquire) {
             unsafe { engine.answer(transfer) };
+            if unsafe { engine.submit_capture(transfer) }.is_err() {
+                engine.stats.capture_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
     } else {
-        engine.stats.capture_failures.fetch_add(1, Ordering::Relaxed);
-    }
-    if engine.running.load(Ordering::Acquire) && unsafe { engine.submit_capture(transfer) }.is_err() {
+        // Not sent again: once the device is gone the hub completes a resend
+        // inline, which would recurse through this routine until the stack
+        // overflows.
         engine.stats.capture_failures.fetch_add(1, Ordering::Relaxed);
     }
     engine.in_flight.fetch_sub(1, Ordering::AcqRel);
