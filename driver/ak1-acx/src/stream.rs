@@ -123,6 +123,20 @@ impl Engine {
         max_packet_bytes: u16,
         audio: &Audio,
     ) -> Result<alloc::boxed::Box<Engine>, NTSTATUS> {
+        // The USB stack schedules an ASAP transfer right after the previous
+        // one on its pipe, however long ago that stream stopped. Without a
+        // reset, playback of a new stream runs hundreds of frames away from
+        // its capture, and some capture packets come back never written.
+        for pipe in [usb.audio_in, usb.audio_out] {
+            check(unsafe {
+                call_unsafe_wdf_function_binding!(
+                    WdfUsbTargetPipeResetSynchronously,
+                    pipe,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut()
+                )
+            })?;
+        }
         unsafe { usb.set_audio_params(rate, max_packet_bytes)? };
 
         let mut engine = alloc::boxed::Box::new(Engine {
