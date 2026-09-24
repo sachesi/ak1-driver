@@ -18,10 +18,11 @@ DefaultDestDir = 13
 [SourceDisksFiles]
 ak1acx.sys = 1,,
 
+; Built for KMDF 1.33, which first shipped in Windows 11 21H2 (build 22000).
 [Manufacturer]
-%ProviderName% = Devices,NTamd64.10.0...16299
+%ProviderName% = Devices,NTamd64.10.0...22000
 
-[Devices.NTamd64.10.0...16299]
+[Devices.NTamd64.10.0...22000]
 %DeviceDesc% = Ak1_Device, USB\VID_17CC&PID_0815
 
 [Ak1_Device.NT]
