@@ -23,7 +23,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { sample_rate: 48_000, buffer_multiple: 2 }
+        Settings { sample_rate: 48_000, buffer_multiple: 4 }
     }
 }
 
@@ -50,7 +50,10 @@ impl Settings {
     }
 }
 
-/// At least one USB transfer plus some slack, as a power of two.
+/// One USB transfer plus some slack, as a power of two. The host works on one
+/// half of the ASIO double buffer while the other half streams, so the whole
+/// buffer spans at least two transfers. Audio still arrives one transfer at a
+/// time, so buffer switches come in small bursts at this size.
 pub fn min_buffer_frames(rate: u32) -> u32 {
     (rate * TRANSFER_MS * 9 / 8).div_ceil(1000).next_power_of_two()
 }
@@ -105,12 +108,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buffers_hold_a_usb_transfer_and_keep_their_length_across_rates() {
+    fn double_buffers_hold_two_usb_transfers_and_keep_their_length_across_rates() {
         let sizes = RATES.map(min_buffer_frames);
         assert_eq!(sizes, [64, 64, 128, 128, 256]);
         for (rate, size) in RATES.into_iter().zip(sizes) {
-            assert!(size * 1000 >= rate * TRANSFER_MS);
+            assert!(2 * size * 1000 >= 2 * rate * TRANSFER_MS);
         }
+        assert_eq!(RATES.map(max_buffer_frames), [2048, 2048, 4096, 4096, 8192]);
         let settings = Settings { sample_rate: 48_000, buffer_multiple: 4 };
         assert_eq!(settings.buffer_frames(96_000), 512);
         assert_eq!(max_buffer_frames(48_000), 2048);

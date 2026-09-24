@@ -14,7 +14,9 @@ use windows_core::{GUID, IUnknown, Interface};
 
 use crate::abi::*;
 use crate::duplex::{Clock, Duplex, Endpoints, Host, INPUTS, OUTPUTS, find_endpoints, request_reset};
-use crate::settings::{self, RATES, Settings, TRANSFER_MS, max_buffer_frames, min_buffer_frames};
+use crate::settings::{
+    self, RATES, Settings, TRANSFER_MS, max_buffer_frames, min_buffer_frames,
+};
 
 pub const CLSID: GUID = GUID::from_u128(0x3f1c6b2a_8e4d_4c7b_9a15_2d6e8f0b4c31);
 pub const DRIVER_NAME: &str = "Audio Kontrol 1";
@@ -434,9 +436,14 @@ unsafe extern "system" fn create_buffers(
         return driver.fail(ASE_NOT_PRESENT, "driver not initialized");
     };
     let rate = driver.rate;
-    let (min, max) = (min_buffer_frames(rate) as i32, max_buffer_frames(rate) as i32);
+    // Some hosts list the sizes once, at the rate the driver had then, and
+    // may pair one with another rate. Longer buffers work at any rate.
+    let (min, max) = (min_buffer_frames(rate) as i32, max_buffer_frames(RATES[RATES.len() - 1]) as i32);
     if infos.is_null() || callbacks.is_null() || channels <= 0 || buffer_size < min || buffer_size > max {
-        return driver.fail(ASE_INVALID_PARAMETER, format!("buffer size {buffer_size} outside {min}..={max}"));
+        return driver.fail(
+            ASE_INVALID_PARAMETER,
+            format!("buffer size {buffer_size} outside {min}..={max} at {rate} Hz"),
+        );
     }
     let frames = buffer_size as usize;
     let infos = unsafe { std::slice::from_raw_parts_mut(infos, channels as usize) };

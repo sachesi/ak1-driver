@@ -46,7 +46,11 @@ device at a rate other than ... Hz".
 "Audio Kontrol 1 Control Panel" in the Start menu, or a DAW's ASIO settings
 button, opens the control panel. It sets the sample rate and buffer size the
 ASIO driver offers to DAWs that do not choose their own; a DAW that has the
-driver open is asked to reload it when the buffer size changes. It also shows
+driver open is asked to reload it when the buffer size changes. DAWs are
+offered the sizes that work at the current rate: 64 to 2048 samples at 44.1
+and 48 kHz, 128 to 4096 at 88.2 and 96 kHz, 256 to 8192 at 192 kHz. DAWs that
+list the sizes only once, such as Ardour, get the list for the panel's rate.
+It also shows
 whether the card is working, the driver and firmware versions and the error
 counts of the last stream, plays a test tone on either output pair and meters
 the inputs. While the meter is on it holds the card at the Windows sample
