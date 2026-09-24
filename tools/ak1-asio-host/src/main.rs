@@ -12,7 +12,8 @@ use ak1_asio::abi::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
 use windows_core::IUnknown;
 
-const USAGE: &str = "usage: ak1-asio-host <rate-hz> <buffer-frames|pref> <seconds> [channels, e.g. in1,out3,out4]";
+const USAGE: &str =
+    "usage: ak1-asio-host <rate-hz> <buffer-frames|pref> <seconds> [channels, e.g. in1,out3,out4] | panel";
 const INPUTS: usize = 2;
 const OUTPUTS: usize = 4;
 
@@ -49,8 +50,28 @@ fn main() -> ExitCode {
     }
 }
 
+/// Creates and initializes the registered driver.
+fn load() -> Result<IUnknown> {
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+    let driver: IUnknown = unsafe { CoCreateInstance(&CLSID, None, CLSCTX_INPROC_SERVER)? };
+    let this: Driver = windows_core::Interface::as_raw(&driver).cast();
+    if unsafe { ((**this).init)(this.cast(), std::ptr::null_mut()) } == 0 {
+        return Err(format!("init failed: {}", message(this)).into());
+    }
+    Ok(driver)
+}
+
+/// Opens the driver's control panel, as a host's settings button does.
+fn open_panel() -> Result<()> {
+    let driver = load()?;
+    let this: Driver = windows_core::Interface::as_raw(&driver).cast();
+    let error = unsafe { ((**this).control_panel)(this.cast()) };
+    if error == ASE_OK { Ok(()) } else { Err(format!("controlPanel returned {error}: {}", message(this)).into()) }
+}
+
 fn run(args: &[String]) -> Result<()> {
     let (rate, frames, seconds, channels) = match args {
+        [command] if command == "panel" => return open_panel(),
         [rate, frames, seconds] => (rate, frames, seconds, None),
         [rate, frames, seconds, channels] => (rate, frames, seconds, Some(channels.as_str())),
         _ => return Err(USAGE.into()),
@@ -58,18 +79,12 @@ fn run(args: &[String]) -> Result<()> {
     let rate: f64 = rate.parse()?;
     let seconds: f64 = seconds.parse()?;
 
-    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
-    let unknown: IUnknown = unsafe { CoCreateInstance(&CLSID, None, CLSCTX_INPROC_SERVER)? };
-    let driver = unknown.clone();
+    let driver = load()?;
     let this: Driver = windows_core::Interface::as_raw(&driver).cast();
     let vtbl = unsafe { &**this };
     let call = |error: AsioError, what: &str| -> Result<()> {
         if error == ASE_OK { Ok(()) } else { Err(format!("{what} returned {error}: {}", message(this)).into()) }
     };
-
-    if unsafe { (vtbl.init)(this.cast(), std::ptr::null_mut()) } == 0 {
-        return Err(format!("init failed: {}", message(this)).into());
-    }
     let mut name = [0u8; 32];
     unsafe { (vtbl.get_driver_name)(this.cast(), name.as_mut_ptr()) };
     let (mut inputs, mut outputs) = (0, 0);
@@ -145,7 +160,6 @@ fn run(args: &[String]) -> Result<()> {
         RESET_REQUESTS.load(Ordering::Acquire),
     );
     drop(driver);
-    drop(unknown);
     Ok(())
 }
 
