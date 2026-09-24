@@ -225,9 +225,15 @@ extern "C" fn evt_release_hardware(device: WDFDEVICE, _translated: WDFCMRESLIST)
     STATUS_SUCCESS
 }
 
-/// Leaves the engine's counters under the device key for diagnostics.
+/// Leaves the engine's counters under the device key for diagnostics. Windows
+/// briefly opens an endpoint after an exclusive stream closes; such streams
+/// move no audio and would hide the one before.
 unsafe fn record_stream_stats(device: WDFDEVICE, stats: &Stats) {
-    let bytes: [u8; 36] = unsafe { core::mem::transmute(stats.snapshot()) };
+    let snapshot = stats.snapshot();
+    if snapshot[0] == 0 {
+        return;
+    }
+    let bytes: [u8; 36] = unsafe { core::mem::transmute(snapshot) };
     if let Ok(key) = unsafe { DeviceKey::open(device, KEY_SET_VALUE) } {
         let _ = unsafe { key.assign(&STREAM_STATS_VALUE, &bytes, REG_BINARY) };
     }
