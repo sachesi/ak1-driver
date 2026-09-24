@@ -35,9 +35,9 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
 const WAIT_MS: u32 = 1000;
 
 pub struct Endpoints {
-    output12: IMMDevice,
-    output34: IMMDevice,
-    input12: IMMDevice,
+    pub output12: IMMDevice,
+    pub output34: IMMDevice,
+    pub input12: IMMDevice,
 }
 
 /// Finds the endpoints whose KS filter is one of our circuits. Needs a
@@ -248,6 +248,15 @@ impl Drop for Duplex {
     }
 }
 
+/// Asks the host to tear the session down and build it again.
+pub fn request_reset(callbacks: &crate::abi::AsioCallbacks) {
+    let message = callbacks.asio_message;
+    let null = std::ptr::null_mut();
+    if unsafe { message(K_ASIO_SELECTOR_SUPPORTED, K_ASIO_RESET_REQUEST, null, null.cast()) } == 1 {
+        unsafe { message(K_ASIO_RESET_REQUEST, 0, null, null.cast()) };
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Source {
     Stop,
@@ -325,19 +334,10 @@ impl Worker {
             }
         };
         if failed {
-            self.request_reset();
+            request_reset(&self.host.callbacks);
         }
         if let Ok(task) = task {
             let _ = unsafe { AvRevertMmThreadCharacteristics(task) };
-        }
-    }
-
-    /// Asks the host to tear the session down and build it again.
-    fn request_reset(&self) {
-        let message = self.host.callbacks.asio_message;
-        let null = std::ptr::null_mut();
-        if unsafe { message(K_ASIO_SELECTOR_SUPPORTED, K_ASIO_RESET_REQUEST, null, null.cast()) } == 1 {
-            unsafe { message(K_ASIO_RESET_REQUEST, 0, null, null.cast()) };
         }
     }
 

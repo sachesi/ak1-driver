@@ -4,8 +4,10 @@
 pub mod abi;
 mod driver;
 mod duplex;
+pub mod settings;
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{
@@ -21,6 +23,7 @@ use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_core::{BOOL, GUID, HRESULT, HSTRING, IUnknown, Interface, PCWSTR, Ref, implement};
 
 pub use driver::{CLSID, DRIVER_NAME};
+pub use duplex::{Endpoints, find_endpoints};
 
 static MODULE: AtomicIsize = AtomicIsize::new(0);
 static OBJECTS: AtomicU32 = AtomicU32::new(0);
@@ -109,11 +112,16 @@ extern "system" fn DllUnregisterServer() -> HRESULT {
     S_OK
 }
 
-fn register() -> windows_core::Result<()> {
+/// Path of this DLL.
+pub(crate) fn module_path() -> PathBuf {
     let mut path = [0u16; MAX_PATH as usize];
     let module = HMODULE(MODULE.load(Ordering::Acquire) as *mut c_void);
     let len = unsafe { GetModuleFileNameW(Some(module), &mut path) } as usize;
-    let path = String::from_utf16_lossy(&path[..len]);
+    PathBuf::from(String::from_utf16_lossy(&path[..len]))
+}
+
+fn register() -> windows_core::Result<()> {
+    let path = module_path().display().to_string();
     let clsid = format!("{{{CLSID:?}}}");
 
     let class = format!("CLSID\\{clsid}");

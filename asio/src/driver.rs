@@ -3,22 +3,24 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 
-use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
+use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, HANDLE, S_OK, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::AUDCLNT_E_UNSUPPORTED_FORMAT;
 use windows::Win32::System::Com::{CO_MTA_USAGE_COOKIE, CoDecrementMTAUsage, CoIncrementMTAUsage};
+use windows::Win32::System::Registry::{REG_NOTIFY_CHANGE_LAST_SET, RegCloseKey, RegNotifyChangeKeyValue};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows_core::{GUID, IUnknown, Interface};
 
 use crate::abi::*;
-use crate::duplex::{Clock, Duplex, Endpoints, Host, INPUTS, OUTPUTS, find_endpoints};
+use crate::duplex::{Clock, Duplex, Endpoints, Host, INPUTS, OUTPUTS, find_endpoints, request_reset};
+use crate::settings::{self, RATES, Settings, TRANSFER_MS, max_buffer_frames, min_buffer_frames};
 
 pub const CLSID: GUID = GUID::from_u128(0x3f1c6b2a_8e4d_4c7b_9a15_2d6e8f0b4c31);
 pub const DRIVER_NAME: &str = "Audio Kontrol 1";
 const DRIVER_VERSION: i32 = 1;
-const RATES: [u32; 5] = [44_100, 48_000, 88_200, 96_000, 192_000];
-const DEFAULT_RATE: u32 = 48_000;
-/// Audio the driver moves per USB transfer, which bounds the smallest buffer.
-const TRANSFER_MS: u32 = 4;
+/// The control panel, installed next to this DLL.
+const PANEL_EXE: &str = "ak1-panel.exe";
 
 struct Session {
     duplex: Duplex,
@@ -57,6 +59,7 @@ pub struct AsioObject {
     refs: AtomicU32,
     driver: Mutex<Driver>,
     clock: Arc<Clock>,
+    watch: Mutex<Option<SettingsWatch>>,
 }
 
 // The endpoints and streams are free-threaded COM objects.
@@ -71,16 +74,85 @@ impl AsioObject {
                 mta: None,
                 endpoints: None,
                 error: String::new(),
-                rate: DEFAULT_RATE,
+                rate: Settings::load().sample_rate,
                 session: None,
             }),
             clock: Arc::new(Clock::default()),
+            watch: Mutex::new(None),
         }))
     }
 
     fn driver(&self) -> MutexGuard<'_, Driver> {
         self.driver.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// Asks the host to rebuild its buffers when the control panel changed
+    /// the buffer size to one the running session does not use.
+    fn apply_buffer_size(&self, settings: Settings) {
+        let callbacks = {
+            let driver = self.driver();
+            match &driver.session {
+                Some(session) if session.host.buffer_frames != settings.buffer_frames(driver.rate) as usize => {
+                    session.host.callbacks
+                }
+                _ => return,
+            }
+        };
+        request_reset(&callbacks);
+    }
+}
+
+impl Drop for AsioObject {
+    fn drop(&mut self) {
+        // The watch thread uses this object, so it has to end first.
+        self.watch.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    }
+}
+
+/// Follows the control panel's changes to the settings while a host has the driver open.
+struct SettingsWatch {
+    quit: HANDLE,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SettingsWatch {
+    fn start(object: *const AsioObject) -> windows_core::Result<SettingsWatch> {
+        let quit = unsafe { CreateEventW(None, true, false, None)? };
+        // Raw handles and pointers are not Send; the thread ends before either goes away.
+        let (object, quit_handle) = (object as usize, quit.0 as usize);
+        let thread = std::thread::spawn(move || {
+            watch_settings(unsafe { &*(object as *const AsioObject) }, HANDLE(quit_handle as *mut c_void));
+        });
+        Ok(SettingsWatch { quit, thread: Some(thread) })
+    }
+}
+
+impl Drop for SettingsWatch {
+    fn drop(&mut self) {
+        let _ = unsafe { SetEvent(self.quit) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = unsafe { CloseHandle(self.quit) };
+    }
+}
+
+fn watch_settings(object: &AsioObject, quit: HANDLE) {
+    let Ok(key) = settings::open_key() else { return };
+    if let Ok(changed) = unsafe { CreateEventW(None, false, false, None) } {
+        let mut last = Settings::load();
+        while unsafe { RegNotifyChangeKeyValue(key, false, REG_NOTIFY_CHANGE_LAST_SET, Some(changed), true) }.is_ok()
+            && unsafe { WaitForMultipleObjects(&[quit, changed], false, INFINITE) }.0 == WAIT_OBJECT_0.0 + 1
+        {
+            let settings = Settings::load();
+            if settings.buffer_multiple != last.buffer_multiple {
+                object.apply_buffer_size(settings);
+            }
+            last = settings;
+        }
+        let _ = unsafe { CloseHandle(changed) };
+    }
+    let _ = unsafe { RegCloseKey(key) };
 }
 
 impl Driver {
@@ -88,11 +160,6 @@ impl Driver {
         self.error = message.into();
         error
     }
-}
-
-fn min_buffer_frames(rate: u32) -> i32 {
-    // At least one USB transfer plus some slack, as a power of two.
-    ((rate * TRANSFER_MS * 9 / 8).div_ceil(1000)).next_power_of_two() as i32
 }
 
 static VTBL: IAsioVtbl<AsioObject> = IAsioVtbl {
@@ -152,7 +219,14 @@ unsafe extern "system" fn release(this: *mut AsioObject) -> u32 {
 }
 
 unsafe extern "system" fn init(this: *mut AsioObject, _sys_handle: *mut c_void) -> AsioBool {
-    let mut driver = unsafe { (*this).driver() };
+    let object = unsafe { &*this };
+    let mut watch = object.watch.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if watch.is_none() {
+        // Without it, a new buffer size applies from the next time the host loads the driver.
+        *watch = SettingsWatch::start(this).ok();
+    }
+    drop(watch);
+    let mut driver = object.driver();
     if driver.mta.is_none() {
         match unsafe { CoIncrementMTAUsage() } {
             Ok(cookie) => driver.mta = Some(cookie),
@@ -230,7 +304,10 @@ unsafe extern "system" fn get_channels(_this: *mut AsioObject, inputs: *mut i32,
 
 unsafe extern "system" fn get_latencies(this: *mut AsioObject, input: *mut i32, output: *mut i32) -> AsioError {
     let driver = unsafe { (*this).driver() };
-    let frames = driver.session.as_ref().map_or(min_buffer_frames(driver.rate), |s| s.host.buffer_frames as i32);
+    let frames = driver
+        .session
+        .as_ref()
+        .map_or(Settings::load().buffer_frames(driver.rate) as i32, |s| s.host.buffer_frames as i32);
     let transfer = (driver.rate * TRANSFER_MS / 1000) as i32;
     unsafe {
         *input = frames + transfer;
@@ -246,12 +323,11 @@ unsafe extern "system" fn get_buffer_size(
     preferred: *mut i32,
     granularity: *mut i32,
 ) -> AsioError {
-    let driver = unsafe { (*this).driver() };
-    let smallest = min_buffer_frames(driver.rate);
+    let rate = unsafe { (*this).driver() }.rate;
     unsafe {
-        *min = smallest;
-        *max = 8 * smallest;
-        *preferred = 2 * smallest;
+        *min = min_buffer_frames(rate) as i32;
+        *max = max_buffer_frames(rate) as i32;
+        *preferred = Settings::load().buffer_frames(rate) as i32;
         *granularity = -1;
     }
     ASE_OK
@@ -358,9 +434,9 @@ unsafe extern "system" fn create_buffers(
         return driver.fail(ASE_NOT_PRESENT, "driver not initialized");
     };
     let rate = driver.rate;
-    let min = min_buffer_frames(rate);
-    if infos.is_null() || callbacks.is_null() || channels <= 0 || buffer_size < min || buffer_size > 8 * min {
-        return driver.fail(ASE_INVALID_PARAMETER, format!("buffer size {buffer_size} outside {min}..={}", 8 * min));
+    let (min, max) = (min_buffer_frames(rate) as i32, max_buffer_frames(rate) as i32);
+    if infos.is_null() || callbacks.is_null() || channels <= 0 || buffer_size < min || buffer_size > max {
+        return driver.fail(ASE_INVALID_PARAMETER, format!("buffer size {buffer_size} outside {min}..={max}"));
     }
     let frames = buffer_size as usize;
     let infos = unsafe { std::slice::from_raw_parts_mut(infos, channels as usize) };
@@ -422,8 +498,12 @@ unsafe extern "system" fn dispose_buffers(this: *mut AsioObject) -> AsioError {
     ASE_OK
 }
 
-unsafe extern "system" fn control_panel(_this: *mut AsioObject) -> AsioError {
-    ASE_NOT_PRESENT
+unsafe extern "system" fn control_panel(this: *mut AsioObject) -> AsioError {
+    let panel = crate::module_path().with_file_name(PANEL_EXE);
+    match std::process::Command::new(&panel).spawn() {
+        Ok(_) => ASE_OK,
+        Err(e) => unsafe { (*this).driver() }.fail(ASE_NOT_PRESENT, format!("starting {} failed: {e}", panel.display())),
+    }
 }
 
 unsafe extern "system" fn future(_this: *mut AsioObject, selector: i32, _opt: *mut c_void) -> AsioError {
