@@ -10,18 +10,17 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ak1_proto::mode2::{self, CHANNELS, PlaybackEncoder};
 use ak1_proto::{MAX_PACKET_SIZE, SampleRate};
-use wdk_sys::ntddk::{
-    IoAllocateMdl, IoFreeMdl, KeAcquireSpinLockRaiseToDpc, KeDelayExecutionThread, KeReleaseSpinLock,
-    MmBuildMdlForNonPagedPool,
-};
+use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, KeDelayExecutionThread, MmBuildMdlForNonPagedPool};
 use wdk_sys::{
-    _MODE, _WDF_IO_TARGET_SENT_IO_ACTION, KSPIN_LOCK, LARGE_INTEGER, NT_SUCCESS, NTSTATUS, PMDL,
+    _MODE, _WDF_IO_TARGET_SENT_IO_ACTION, LARGE_INTEGER, NT_SUCCESS, NTSTATUS, PMDL,
     PWDF_REQUEST_COMPLETION_PARAMS, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS, URB, URB_FUNCTION_ISOCH_TRANSFER,
     USBD_ISO_PACKET_DESCRIPTOR, USBD_START_ISO_TRANSFER_ASAP, USBD_TRANSFER_DIRECTION_IN,
     USBD_TRANSFER_DIRECTION_OUT, WDF_REQUEST_REUSE_PARAMS, WDFCONTEXT, WDFDEVICE, WDFIOTARGET, WDFMEMORY,
     WDFREQUEST, WDFUSBPIPE, _URB_ISOCH_TRANSFER, call_unsafe_wdf_function_binding,
 };
 
+use crate::audio::Audio;
+use crate::rt::qpc_now;
 use crate::usb::Ak1Usb;
 use crate::wdf::object_attributes;
 
@@ -33,6 +32,7 @@ const TRANSFERS: usize = 16;
 const TRANSFER_BYTES: usize = PACKETS_PER_TRANSFER * MAX_PACKET_SIZE;
 const USBD_STATUS_SUCCESS: i32 = 0;
 const MICROFRAMES_PER_SECOND: u32 = 8000;
+const MAX_FRAMES_PER_PACKET: usize = MAX_PACKET_SIZE / mode2::FRAME_BYTES;
 
 #[derive(Default)]
 pub struct Stats {
@@ -83,7 +83,8 @@ pub struct Engine {
     playbacks: Vec<Transfer>,
     running: AtomicBool,
     in_flight: AtomicU32,
-    lock: UnsafeCell<KSPIN_LOCK>,
+    audio: *const Audio,
+    /// Only touched while holding the audio lock.
     codec: UnsafeCell<Codec>,
     pub stats: Stats,
 }
@@ -105,18 +106,20 @@ impl Codec {
     }
 }
 
-// The codec is only touched under `lock`; everything else is atomic or
-// immutable after `start`.
+// The codec is only touched under the audio lock; everything else is atomic
+// or immutable after `start`.
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
-    /// Configures the device for `rate` and starts streaming silence.
+    /// Configures the device for `rate` and starts streaming the running
+    /// streams of `audio`, silence where none runs.
     pub unsafe fn start(
         device: WDFDEVICE,
         usb: &Ak1Usb,
         rate: SampleRate,
         max_packet_bytes: u16,
+        audio: &Audio,
     ) -> Result<alloc::boxed::Box<Engine>, NTSTATUS> {
         unsafe { usb.set_audio_params(rate, max_packet_bytes)? };
 
@@ -129,7 +132,7 @@ impl Engine {
             playbacks: Vec::with_capacity(TRANSFERS),
             running: AtomicBool::new(false),
             in_flight: AtomicU32::new(0),
-            lock: UnsafeCell::new(0),
+            audio,
             codec: UnsafeCell::new(Codec::default()),
             stats: Stats::default(),
         });
@@ -241,40 +244,56 @@ impl Engine {
             self.stats.playback_overruns.fetch_add(1, Ordering::Relaxed);
         }
 
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        let codec = unsafe { &mut *self.codec.get() };
         let captured = unsafe { iso_packets(capture.urb) };
         let mut playback_packets = playback.map(|t| unsafe { iso_packets(t.urb) });
-        let mut offset = 0;
-        for (i, packet) in captured.iter().enumerate() {
-            let received = packet.Length as usize;
-            // Some hosts report lost packets as successful and full-sized.
-            let valid = packet.Status == USBD_STATUS_SUCCESS
-                && received <= self.max_packet_bytes
-                && received % mode2::FRAME_BYTES == 0;
-            let len = if valid { received } else { 0 };
-            if !valid {
-                self.stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-            }
-            let data = unsafe { core::slice::from_raw_parts(capture.buffer.add(packet.Offset as usize), len) };
-            let status = mode2::decode_capture(data, |_frame| {});
-            self.stats.frames.fetch_add(status.frames as u32, Ordering::Relaxed);
-            self.stats.check_errors.fetch_add(status.check_errors as u32, Ordering::Relaxed);
-            if status.output_rejected {
-                self.stats.rejected_packets.fetch_add(1, Ordering::Relaxed);
-            }
+        let audio = unsafe { &*self.audio };
+        let offset = unsafe {
+            audio.process(qpc_now(), |frames| {
+                let codec = &mut *self.codec.get();
+                let mut offset = 0;
+                for (i, packet) in captured.iter().enumerate() {
+                    let received = packet.Length as usize;
+                    // Some hosts report lost packets as successful and full-sized.
+                    let valid = packet.Status == USBD_STATUS_SUCCESS
+                        && received <= self.max_packet_bytes
+                        && received % mode2::FRAME_BYTES == 0;
+                    let len = if valid { received } else { 0 };
+                    if !valid {
+                        self.stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let data = core::slice::from_raw_parts(capture.buffer.add(packet.Offset as usize), len);
+                    let mut decoded = [[0; CHANNELS]; MAX_FRAMES_PER_PACKET];
+                    let mut decoded_len = 0;
+                    let status = mode2::decode_capture(data, |frame| {
+                        decoded[decoded_len] = frame;
+                        decoded_len += 1;
+                    });
+                    self.stats.frames.fetch_add(status.frames as u32, Ordering::Relaxed);
+                    self.stats.check_errors.fetch_add(status.check_errors as u32, Ordering::Relaxed);
+                    if status.output_rejected {
+                        self.stats.rejected_packets.fetch_add(1, Ordering::Relaxed);
+                    }
 
-            // Keep feeding the device's clock when the capture packet is lost.
-            let out_len = if valid { len } else { codec.nominal_frames(self.rate_hz) * mode2::FRAME_BYTES };
-            if let (Some(transfer), Some(packets)) = (playback, playback_packets.as_deref_mut()) {
-                packets[i].Offset = offset as u32;
-                packets[i].Length = out_len as u32;
-                let out = unsafe { core::slice::from_raw_parts_mut(transfer.buffer.add(offset), out_len) };
-                codec.encoder.encode(out, || [0; CHANNELS]);
-                offset += out_len;
-            }
-        }
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+                    // A lost packet still took device time: keep both streams
+                    // moving by the nominal frame count.
+                    let frame_count = if valid { status.frames } else { codec.nominal_frames(self.rate_hz) };
+                    let clean = valid && status.check_errors == 0;
+                    for frame in &decoded[..frame_count] {
+                        frames.capture(if clean { [frame[0], frame[1]] } else { [0; 2] });
+                    }
+
+                    let out_len = frame_count * mode2::FRAME_BYTES;
+                    if let (Some(transfer), Some(packets)) = (playback, playback_packets.as_deref_mut()) {
+                        packets[i].Offset = offset as u32;
+                        packets[i].Length = out_len as u32;
+                        let out = core::slice::from_raw_parts_mut(transfer.buffer.add(offset), out_len);
+                        codec.encoder.encode(out, || frames.render());
+                        offset += out_len;
+                    }
+                }
+                offset
+            })
+        };
 
         let Some(transfer) = playback else { return };
         if offset == 0 {

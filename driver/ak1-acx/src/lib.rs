@@ -6,26 +6,29 @@ extern crate alloc;
 #[cfg(not(test))]
 extern crate wdk_panic;
 
+mod audio;
+mod circuit;
+mod ks;
+mod rt;
 mod stream;
 mod usb;
 mod wdf;
 
-use alloc::boxed::Box;
-
-use acx_sys::{ACX_DEVICE_CONFIG, ACX_DEVICEINIT_CONFIG, ACX_DRIVER_CONFIG, call_acx};
-use ak1_proto::{DeviceSpec, SampleRate, mode2};
+use acx_sys::{ACX_DEVICE_CONFIG, ACX_DEVICEINIT_CONFIG, ACX_DRIVER_CONFIG, ACXCIRCUIT, ACXSTREAM, call_acx};
+use ak1_proto::mode2;
 use wdk::println;
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
-    _WDF_EXECUTION_LEVEL, _WDF_SYNCHRONIZATION_SCOPE, ACCESS_MASK, KEY_QUERY_VALUE, KEY_SET_VALUE, NT_SUCCESS,
-    NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PLUGPLAY_REGKEY_DEVICE, PWDFDEVICE_INIT, REG_BINARY,
+    _WDF_EXECUTION_LEVEL, _WDF_SYNCHRONIZATION_SCOPE, ACCESS_MASK, KEY_SET_VALUE, NT_SUCCESS, NTSTATUS,
+    PCUNICODE_STRING, PDRIVER_OBJECT, PLUGPLAY_REGKEY_DEVICE, PWDFDEVICE_INIT, REG_BINARY, REG_DWORD,
     STATUS_NOT_SUPPORTED, STATUS_SUCCESS, UNICODE_STRING, WDF_DRIVER_CONFIG, WDF_NO_OBJECT_ATTRIBUTES,
-    WDF_OBJECT_ATTRIBUTES, WDF_OBJECT_CONTEXT_TYPE_INFO, WDF_PNPPOWER_EVENT_CALLBACKS, WDF_POWER_DEVICE_STATE,
-    WDFCMRESLIST, WDFDEVICE, WDFDRIVER, WDFKEY, call_unsafe_wdf_function_binding,
+    WDF_OBJECT_ATTRIBUTES, WDF_OBJECT_CONTEXT_TYPE_INFO, WDF_PNPPOWER_EVENT_CALLBACKS, WDFCMRESLIST, WDFDEVICE,
+    WDFDRIVER, WDFKEY, WDFWAITLOCK, call_unsafe_wdf_function_binding,
 };
 
-use crate::stream::Engine;
+use crate::audio::Audio;
+use crate::stream::Stats;
 use crate::usb::Ak1Usb;
 
 #[cfg(not(test))]
@@ -34,8 +37,9 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 struct DeviceContext {
     usb: Option<Ak1Usb>,
-    spec: Option<DeviceSpec>,
-    engine: Option<Box<Engine>>,
+    audio: Audio,
+    circuits: [ACXCIRCUIT; 3],
+    circuits_added: bool,
 }
 
 #[repr(transparent)]
@@ -52,9 +56,16 @@ static DEVICE_CONTEXT_TYPE: ContextTypeInfo = ContextTypeInfo(WDF_OBJECT_CONTEXT
     EvtDriverGetUniqueContextType: None,
 });
 
+static STREAM_CONTEXT_TYPE: ContextTypeInfo = ContextTypeInfo(WDF_OBJECT_CONTEXT_TYPE_INFO {
+    Size: size_of::<WDF_OBJECT_CONTEXT_TYPE_INFO>() as u32,
+    ContextName: c"StreamContext".as_ptr(),
+    ContextSize: size_of::<*mut rt::RtStream>(),
+    UniqueType: &STREAM_CONTEXT_TYPE.0,
+    EvtDriverGetUniqueContextType: None,
+});
+
 // Values under the device's hardware key.
 static FIRMWARE_VERSION_VALUE: [u16; 15] = utf16(b"FirmwareVersion");
-static TEST_RATE_VALUE: [u16; 8] = utf16(b"TestRate");
 static STREAM_STATS_VALUE: [u16; 11] = utf16(b"StreamStats");
 
 #[unsafe(export_name = "DriverEntry")]
@@ -84,28 +95,24 @@ pub unsafe extern "system" fn driver_entry(driver: PDRIVER_OBJECT, registry_path
 }
 
 extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INIT) -> NTSTATUS {
-    let status = unsafe { add_device(&mut device_init) };
+    let status = into_status(unsafe { add_device(&mut device_init) });
     println!("ak1acx: device add status {status:#010x}");
     status
 }
 
-unsafe fn add_device(device_init: &mut PWDFDEVICE_INIT) -> NTSTATUS {
+unsafe fn add_device(device_init: &mut PWDFDEVICE_INIT) -> Result<(), NTSTATUS> {
     let mut init_config = ACX_DEVICEINIT_CONFIG {
         Size: size_of::<ACX_DEVICEINIT_CONFIG>() as u32,
         SynchronizationScope: _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
         ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
         ..Default::default()
     };
-    let status = unsafe { call_acx!(AcxDeviceInitInitialize, *device_init, &mut init_config) };
-    if !NT_SUCCESS(status) {
-        return status;
-    }
+    check(unsafe { call_acx!(AcxDeviceInitInitialize, *device_init, &mut init_config) })?;
 
     let mut pnp_callbacks = WDF_PNPPOWER_EVENT_CALLBACKS {
         Size: size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as u32,
         EvtDevicePrepareHardware: Some(evt_prepare_hardware),
-        EvtDeviceD0Entry: Some(evt_d0_entry),
-        EvtDeviceD0Exit: Some(evt_d0_exit),
+        EvtDeviceReleaseHardware: Some(evt_release_hardware),
         ..Default::default()
     };
     unsafe {
@@ -117,15 +124,26 @@ unsafe fn add_device(device_init: &mut PWDFDEVICE_INIT) -> NTSTATUS {
         ..wdf::object_attributes(core::ptr::null_mut())
     };
     let mut device: WDFDEVICE = core::ptr::null_mut();
-    let status =
-        unsafe { call_unsafe_wdf_function_binding!(WdfDeviceCreate, device_init, &mut attributes, &mut device) };
-    if !NT_SUCCESS(status) {
-        return status;
-    }
-    unsafe { device_context(device).write(DeviceContext { usb: None, spec: None, engine: None }) };
+    check(unsafe { call_unsafe_wdf_function_binding!(WdfDeviceCreate, device_init, &mut attributes, &mut device) })?;
+
+    let mut attributes = wdf::object_attributes(device.cast());
+    let mut control: WDFWAITLOCK = core::ptr::null_mut();
+    check(unsafe { call_unsafe_wdf_function_binding!(WdfWaitLockCreate, &mut attributes, &mut control) })?;
+    unsafe {
+        device_context(device).write(DeviceContext {
+            usb: None,
+            audio: Audio::new(device, control),
+            circuits: [core::ptr::null_mut(); 3],
+            circuits_added: false,
+        })
+    };
 
     let mut device_config = ACX_DEVICE_CONFIG { Size: size_of::<ACX_DEVICE_CONFIG>() as u32, ..Default::default() };
-    unsafe { call_acx!(AcxDeviceInitialize, device, &mut device_config) }
+    check(unsafe { call_acx!(AcxDeviceInitialize, device, &mut device_config) })?;
+
+    let circuits = unsafe { circuit::create_all(device)? };
+    unsafe { (*device_context(device)).circuits = circuits };
+    Ok(())
 }
 
 extern "C" fn evt_prepare_hardware(device: WDFDEVICE, _raw: WDFCMRESLIST, _translated: WDFCMRESLIST) -> NTSTATUS {
@@ -145,44 +163,36 @@ unsafe fn prepare_hardware(device: WDFDEVICE) -> Result<(), NTSTATUS> {
     if spec.data_alignment != 2 || spec.streams() != mode2::STREAMS {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    context.spec = Some(spec);
-    let key = unsafe { DeviceKey::open(device, KEY_SET_VALUE)? };
-    unsafe { key.assign(&FIRMWARE_VERSION_VALUE, &u32::from(spec.fw_version).to_ne_bytes(), wdk_sys::REG_DWORD) }
-}
+    unsafe { context.audio.attach(usb, spec) };
 
-extern "C" fn evt_d0_entry(device: WDFDEVICE, _previous: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
-    let status = into_status(unsafe { start_test_stream(device) });
-    println!("ak1acx: d0 entry status {status:#010x}");
-    status
-}
-
-extern "C" fn evt_d0_exit(device: WDFDEVICE, _target: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
-    let context = unsafe { &mut *device_context(device) };
-    if let Some(engine) = context.engine.take() {
-        unsafe { engine.stop() };
-        let bytes: [u8; 36] = unsafe { core::mem::transmute(engine.stats.snapshot()) };
-        drop(engine);
-        if let Ok(key) = unsafe { DeviceKey::open(device, KEY_SET_VALUE) } {
-            let _ = unsafe { key.assign(&STREAM_STATS_VALUE, &bytes, REG_BINARY) };
+    if !context.circuits_added {
+        for circuit in context.circuits {
+            check(unsafe { call_acx!(AcxDeviceAddCircuit, device, circuit) })?;
         }
+        context.circuits_added = true;
+    }
+
+    let key = unsafe { DeviceKey::open(device, KEY_SET_VALUE)? };
+    unsafe { key.assign(&FIRMWARE_VERSION_VALUE, &u32::from(spec.fw_version).to_ne_bytes(), REG_DWORD) }
+}
+
+extern "C" fn evt_release_hardware(device: WDFDEVICE, _translated: WDFCMRESLIST) -> NTSTATUS {
+    let context = unsafe { &mut *device_context(device) };
+    if context.circuits_added {
+        for circuit in context.circuits {
+            let _ = unsafe { call_acx!(AcxDeviceRemoveCircuit, device, circuit) };
+        }
+        context.circuits_added = false;
     }
     STATUS_SUCCESS
 }
 
-/// Streams silence while the device is in D0 when the hardware key names a
-/// sample rate in `TestRate`. The value is consumed so that a crash while
-/// streaming does not repeat on the next boot.
-unsafe fn start_test_stream(device: WDFDEVICE) -> Result<(), NTSTATUS> {
-    let context = unsafe { &mut *device_context(device) };
-    let rate = {
-        let key = unsafe { DeviceKey::open(device, KEY_QUERY_VALUE | KEY_SET_VALUE)? };
-        let Ok(hz) = (unsafe { key.query_u32(&TEST_RATE_VALUE) }) else { return Ok(()) };
-        unsafe { key.remove(&TEST_RATE_VALUE)? };
-        SampleRate::from_hz(hz).ok_or(STATUS_NOT_SUPPORTED)?
-    };
-    let (Some(usb), Some(spec)) = (context.usb.as_ref(), context.spec) else { return Ok(()) };
-    context.engine = Some(unsafe { Engine::start(device, usb, rate, spec.max_packet_bytes(rate))? });
-    Ok(())
+/// Leaves the engine's counters under the device key for diagnostics.
+unsafe fn record_stream_stats(device: WDFDEVICE, stats: &Stats) {
+    let bytes: [u8; 36] = unsafe { core::mem::transmute(stats.snapshot()) };
+    if let Ok(key) = unsafe { DeviceKey::open(device, KEY_SET_VALUE) } {
+        let _ = unsafe { key.assign(&STREAM_STATS_VALUE, &bytes, REG_BINARY) };
+    }
 }
 
 struct DeviceKey(WDFKEY);
@@ -216,18 +226,6 @@ impl DeviceKey {
             )
         })
     }
-
-    unsafe fn remove(&self, name: &'static [u16]) -> Result<(), NTSTATUS> {
-        let name = unicode(name);
-        check(unsafe { call_unsafe_wdf_function_binding!(WdfRegistryRemoveValue, self.0, &name) })
-    }
-
-    unsafe fn query_u32(&self, name: &'static [u16]) -> Result<u32, NTSTATUS> {
-        let name = unicode(name);
-        let mut value = 0;
-        check(unsafe { call_unsafe_wdf_function_binding!(WdfRegistryQueryULong, self.0, &name, &mut value) })?;
-        Ok(value)
-    }
 }
 
 impl Drop for DeviceKey {
@@ -239,6 +237,13 @@ impl Drop for DeviceKey {
 unsafe fn device_context(device: WDFDEVICE) -> *mut DeviceContext {
     unsafe {
         call_unsafe_wdf_function_binding!(WdfObjectGetTypedContextWorker, device.cast(), &DEVICE_CONTEXT_TYPE.0)
+            .cast()
+    }
+}
+
+unsafe fn stream_context(stream: ACXSTREAM) -> *mut *mut rt::RtStream {
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfObjectGetTypedContextWorker, stream.cast(), &STREAM_CONTEXT_TYPE.0)
             .cast()
     }
 }
