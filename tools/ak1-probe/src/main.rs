@@ -1,4 +1,5 @@
 mod usb;
+mod wasapi;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -8,7 +9,8 @@ use std::process::ExitCode;
 use ak1_proto::{EP_AUDIO_IN, MAX_PACKET_SIZE, Reply, SampleRate};
 use usb::{Ak1, IsochReader, Result};
 
-const USAGE: &str = "usage: ak1-probe info | capture <rate-hz> <seconds> [raw-output-file]";
+const USAGE: &str = "usage: ak1-probe info | capture <rate-hz> <seconds> [raw-output-file] | endpoints \
+                     | play <endpoint> <seconds> <tone-hz> | record <endpoint> <seconds>";
 const MICROFRAMES_PER_SECOND: u64 = 8000;
 
 fn main() -> ExitCode {
@@ -33,6 +35,9 @@ fn run(args: &[String]) -> Result<()> {
             let rate = SampleRate::from_hz(hz).ok_or_else(|| format!("unsupported sample rate {hz}"))?;
             capture(rate, seconds.parse()?, rest.first().map(String::as_str))
         }
+        [cmd] if cmd == "endpoints" => wasapi::list(),
+        [cmd, endpoint, seconds, tone] if cmd == "play" => wasapi::play(endpoint, seconds.parse()?, tone.parse()?),
+        [cmd, endpoint, seconds] if cmd == "record" => wasapi::record(endpoint, seconds.parse()?),
         _ => Err(USAGE.into()),
     }
 }
