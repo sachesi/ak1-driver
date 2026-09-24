@@ -11,12 +11,13 @@ use wdk_sys::ntddk::{
     ExAllocatePool2, ExFreePool, IoAllocateMdl, IoFreeMdl, KeQueryPerformanceCounter, MmBuildMdlForNonPagedPool,
 };
 use wdk_sys::{
-    _WDF_MEMORY_DESCRIPTOR_TYPE, BOOLEAN, NTSTATUS, PMDL, POOL_FLAG_NON_PAGED, PULONG, PULONGLONG,
+    _WDF_MEMORY_DESCRIPTOR_TYPE, BOOLEAN, LARGE_INTEGER, NTSTATUS, PMDL, POOL_FLAG_NON_PAGED, PULONG, PULONGLONG,
     STATUS_DATA_LATE_ERROR, STATUS_DATA_OVERRUN, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER,
     STATUS_SUCCESS, ULONG,
 };
 
 use crate::audio::Audio;
+use crate::stream::{MICROFRAMES_PER_SECOND, PACKETS_PER_TRANSFER};
 
 const PAGE_SIZE: usize = 4096;
 const MAX_PACKETS: usize = 8;
@@ -48,6 +49,7 @@ struct Cursor {
     /// Frames moved since the stream was prepared.
     frames: u64,
     qpc: u64,
+    packet_start_qpc: u64,
 }
 
 pub struct RtStream {
@@ -77,7 +79,7 @@ impl RtStream {
                 packet_bytes: 0,
                 first_offset: 0,
             }),
-            cursor: UnsafeCell::new(Cursor { frames: 0, qpc: 0 }),
+            cursor: UnsafeCell::new(Cursor { frames: 0, qpc: 0, packet_start_qpc: 0 }),
             current_packet: AtomicU32::new(0),
             last_packet_start_qpc: AtomicU64::new(0),
         }
@@ -134,16 +136,21 @@ impl RtStream {
     unsafe fn advance(&self, qpc: u64) {
         let ring = unsafe { &*self.ring.get() };
         let cursor = unsafe { &mut *self.cursor.get() };
-        cursor.frames += 1;
-        cursor.qpc = qpc;
         if ring.count == 0 {
+            cursor.frames += 1;
+            cursor.qpc = qpc;
             return;
         }
         let frames_per_packet = (ring.packet_bytes / self.block_align()) as u64;
-        if cursor.frames % frames_per_packet == 0 {
+        if cursor.frames.is_multiple_of(frames_per_packet) {
+            cursor.packet_start_qpc = qpc;
+        }
+        cursor.frames += 1;
+        cursor.qpc = qpc;
+        if cursor.frames.is_multiple_of(frames_per_packet) {
             let completed = cursor.frames / frames_per_packet - 1;
             self.current_packet.store((completed + 1) as u32, Ordering::Release);
-            self.last_packet_start_qpc.store(qpc, Ordering::Release);
+            self.last_packet_start_qpc.store(cursor.packet_start_qpc, Ordering::Release);
             let _ = unsafe { call_acx!(AcxRtStreamNotifyPacketComplete, self.acx, completed, qpc) };
         }
     }
@@ -158,7 +165,9 @@ impl RtStream {
         let cursor = unsafe { &mut *self.cursor.get() };
         cursor.frames = 0;
         cursor.qpc = 0;
+        cursor.packet_start_qpc = 0;
         self.current_packet.store(0, Ordering::Release);
+        self.last_packet_start_qpc.store(0, Ordering::Release);
     }
 
     unsafe fn allocate_packets(&self, count: usize, packet_bytes: usize) -> Result<PACX_RTPACKET, NTSTATUS> {
@@ -228,6 +237,12 @@ pub fn qpc_now() -> u64 {
     unsafe { KeQueryPerformanceCounter(core::ptr::null_mut()).QuadPart as u64 }
 }
 
+pub fn qpc_frequency() -> u64 {
+    let mut frequency = LARGE_INTEGER::default();
+    let _ = unsafe { KeQueryPerformanceCounter(&mut frequency) };
+    unsafe { frequency.QuadPart as u64 }
+}
+
 pub unsafe fn stream_of<'a>(stream: ACXSTREAM) -> &'a RtStream {
     unsafe { &**crate::stream_context(stream) }
 }
@@ -255,9 +270,13 @@ pub unsafe extern "C" fn evt_pause(stream: ACXSTREAM) -> NTSTATUS {
     STATUS_SUCCESS
 }
 
-pub unsafe extern "C" fn evt_get_hw_latency(_stream: ACXSTREAM, fifo_size: *mut ULONG, delay: *mut ULONG) -> NTSTATUS {
+/// Frames move in whole USB transfers, so one transfer of audio sits between
+/// the ring and the wire.
+pub unsafe extern "C" fn evt_get_hw_latency(stream: ACXSTREAM, fifo_size: *mut ULONG, delay: *mut ULONG) -> NTSTATUS {
+    let rt = unsafe { stream_of(stream) };
+    let frames = rt.rate.hz() as usize * PACKETS_PER_TRANSFER / MICROFRAMES_PER_SECOND as usize;
     unsafe {
-        *fifo_size = 0;
+        *fifo_size = (frames * rt.block_align()) as ULONG;
         *delay = 0;
     }
     STATUS_SUCCESS

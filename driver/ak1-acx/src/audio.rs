@@ -5,7 +5,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
 
 use ak1_proto::{DeviceSpec, SampleRate};
 use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
@@ -44,7 +44,7 @@ pub struct Audio {
 
 pub struct Frames<'a> {
     audio: &'a Audio,
-    qpc: u64,
+    qpc: Cell<u64>,
 }
 
 impl Audio {
@@ -143,8 +143,8 @@ impl Audio {
     }
 
     /// Runs `process` with the running streams while holding the audio lock.
-    pub unsafe fn process<R>(&self, qpc: u64, process: impl FnOnce(&Frames) -> R) -> R {
-        unsafe { self.with_lock(|| process(&Frames { audio: self, qpc })) }
+    pub unsafe fn process<R>(&self, process: impl FnOnce(&Frames) -> R) -> R {
+        unsafe { self.with_lock(|| process(&Frames { audio: self, qpc: Cell::new(0) })) }
     }
 
     unsafe fn with_lock<R>(&self, f: impl FnOnce() -> R) -> R {
@@ -169,6 +169,11 @@ impl Drop for ControlGuard {
 }
 
 impl Frames<'_> {
+    /// Sets the QPC time stamped on the frames that follow.
+    pub fn at(&self, qpc: u64) {
+        self.qpc.set(qpc);
+    }
+
     fn stream(&self, slot: Slot) -> Option<&RtStream> {
         let stream = unsafe { (*self.audio.running.get())[slot as usize] };
         unsafe { stream.as_ref() }
@@ -176,15 +181,15 @@ impl Frames<'_> {
 
     /// Next playback frame for both output pairs, silence where no stream runs.
     pub fn render(&self) -> [i32; 4] {
-        let [a, b] = self.stream(Slot::Output12).map_or([0; 2], |s| unsafe { s.render_frame(self.qpc) });
-        let [c, d] = self.stream(Slot::Output34).map_or([0; 2], |s| unsafe { s.render_frame(self.qpc) });
+        let [a, b] = self.stream(Slot::Output12).map_or([0; 2], |s| unsafe { s.render_frame(self.qpc.get()) });
+        let [c, d] = self.stream(Slot::Output34).map_or([0; 2], |s| unsafe { s.render_frame(self.qpc.get()) });
         [a, b, c, d]
     }
 
     /// Delivers a captured frame of inputs 1/2.
     pub fn capture(&self, samples: [i32; 2]) {
         if let Some(stream) = self.stream(Slot::Input12) {
-            unsafe { stream.capture_frame(samples, self.qpc) };
+            unsafe { stream.capture_frame(samples, self.qpc.get()) };
         }
     }
 }

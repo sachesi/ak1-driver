@@ -20,18 +20,18 @@ use wdk_sys::{
 };
 
 use crate::audio::Audio;
-use crate::rt::qpc_now;
+use crate::rt::{qpc_frequency, qpc_now};
 use crate::usb::Ak1Usb;
 use crate::wdf::object_attributes;
 
 /// Four milliseconds of high-speed microframes (URBs need a multiple of
 /// eight). With less queued, USB passthrough in a QEMU guest loses capture
 /// packets and reports them as successful and full-sized.
-const PACKETS_PER_TRANSFER: usize = 32;
+pub const PACKETS_PER_TRANSFER: usize = 32;
 const TRANSFERS: usize = 16;
 const TRANSFER_BYTES: usize = PACKETS_PER_TRANSFER * MAX_PACKET_SIZE;
 const USBD_STATUS_SUCCESS: i32 = 0;
-const MICROFRAMES_PER_SECOND: u32 = 8000;
+pub const MICROFRAMES_PER_SECOND: u32 = 8000;
 const MAX_FRAMES_PER_PACKET: usize = MAX_PACKET_SIZE / mode2::FRAME_BYTES;
 
 #[derive(Default)]
@@ -79,6 +79,7 @@ pub struct Engine {
     playback_pipe: WDFUSBPIPE,
     rate_hz: u32,
     max_packet_bytes: usize,
+    qpc_per_microframe: u64,
     captures: Vec<Transfer>,
     playbacks: Vec<Transfer>,
     running: AtomicBool,
@@ -128,6 +129,7 @@ impl Engine {
             playback_pipe: usb.audio_out,
             rate_hz: rate.hz(),
             max_packet_bytes: max_packet_bytes.into(),
+            qpc_per_microframe: qpc_frequency() / u64::from(MICROFRAMES_PER_SECOND),
             captures: Vec::with_capacity(TRANSFERS),
             playbacks: Vec::with_capacity(TRANSFERS),
             running: AtomicBool::new(false),
@@ -247,11 +249,15 @@ impl Engine {
         let captured = unsafe { iso_packets(capture.urb) };
         let mut playback_packets = playback.map(|t| unsafe { iso_packets(t.urb) });
         let audio = unsafe { &*self.audio };
+        // The transfer has just ended; each earlier packet ended one microframe before the next.
+        let completed = qpc_now();
+        let last = captured.len() as u64 - 1;
         let offset = unsafe {
-            audio.process(qpc_now(), |frames| {
+            audio.process(|frames| {
                 let codec = &mut *self.codec.get();
                 let mut offset = 0;
                 for (i, packet) in captured.iter().enumerate() {
+                    frames.at(completed - (last - i as u64) * self.qpc_per_microframe);
                     let received = packet.Length as usize;
                     // Some hosts report lost packets as successful and full-sized.
                     let valid = packet.Status == USBD_STATUS_SUCCESS
