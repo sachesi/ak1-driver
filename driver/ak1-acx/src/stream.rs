@@ -12,7 +12,7 @@ use ak1_proto::mode2::{self, CHANNELS, PlaybackEncoder};
 use ak1_proto::{MAX_PACKET_SIZE, SampleRate};
 use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, KeDelayExecutionThread, MmBuildMdlForNonPagedPool};
 use wdk_sys::{
-    _MODE, _WDF_IO_TARGET_SENT_IO_ACTION, LARGE_INTEGER, NT_SUCCESS, NTSTATUS, PMDL,
+    _MODE, _WDF_IO_TARGET_PURGE_IO_ACTION, LARGE_INTEGER, NT_SUCCESS, NTSTATUS, PMDL,
     PWDF_REQUEST_COMPLETION_PARAMS, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS, URB, URB_FUNCTION_ISOCH_TRANSFER,
     USBD_ISO_PACKET_DESCRIPTOR, USBD_START_ISO_TRANSFER_ASAP, USBD_TRANSFER_DIRECTION_IN,
     USBD_TRANSFER_DIRECTION_OUT, WDF_REQUEST_REUSE_PARAMS, WDFCONTEXT, WDFDEVICE, WDFIOTARGET, WDFMEMORY,
@@ -160,13 +160,16 @@ impl Engine {
     /// Cancels all transfers and waits for their completion routines to finish.
     pub unsafe fn stop(&self) {
         self.running.store(false, Ordering::Release);
+        // A completion routine may still send a transfer after this point. A
+        // stopped target would queue it until the restart below, which waits
+        // for it; a purged target fails it instead.
         for pipe in [self.capture_pipe, self.playback_pipe] {
             let target = io_target(pipe);
             unsafe {
                 call_unsafe_wdf_function_binding!(
-                    WdfIoTargetStop,
+                    WdfIoTargetPurge,
                     target,
-                    _WDF_IO_TARGET_SENT_IO_ACTION::WdfIoTargetCancelSentIo
+                    _WDF_IO_TARGET_PURGE_IO_ACTION::WdfIoTargetPurgeIoAndWait
                 )
             };
         }
