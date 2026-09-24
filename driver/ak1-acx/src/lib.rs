@@ -5,12 +5,14 @@
 #[cfg(not(test))]
 extern crate wdk_panic;
 
-use acx_sys::{ACX_DRIVER_CONFIG, call_acx};
+use acx_sys::{ACX_DEVICE_CONFIG, ACX_DEVICEINIT_CONFIG, ACX_DRIVER_CONFIG, call_acx};
+use wdk::println;
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
-    NT_SUCCESS, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, STATUS_SUCCESS, WDF_DRIVER_CONFIG,
-    WDF_NO_OBJECT_ATTRIBUTES, WDFDRIVER, call_unsafe_wdf_function_binding,
+    _WDF_EXECUTION_LEVEL, _WDF_SYNCHRONIZATION_SCOPE, NT_SUCCESS, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT,
+    PWDFDEVICE_INIT, WDF_DRIVER_CONFIG, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDRIVER,
+    call_unsafe_wdf_function_binding,
 };
 
 #[cfg(not(test))]
@@ -43,6 +45,32 @@ pub unsafe extern "system" fn driver_entry(driver: PDRIVER_OBJECT, registry_path
     unsafe { call_acx!(AcxDriverInitialize, wdf_driver, &mut acx_config) }
 }
 
-extern "C" fn evt_device_add(_driver: WDFDRIVER, _device_init: PWDFDEVICE_INIT) -> NTSTATUS {
-    STATUS_SUCCESS
+extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INIT) -> NTSTATUS {
+    let status = unsafe { add_device(&mut device_init) };
+    println!("ak1acx: device add status {status:#010x}");
+    status
+}
+
+unsafe fn add_device(device_init: &mut PWDFDEVICE_INIT) -> NTSTATUS {
+    let mut init_config = ACX_DEVICEINIT_CONFIG {
+        Size: size_of::<ACX_DEVICEINIT_CONFIG>() as u32,
+        SynchronizationScope: _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
+        ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
+        ..Default::default()
+    };
+    let status = unsafe { call_acx!(AcxDeviceInitInitialize, *device_init, &mut init_config) };
+    if !NT_SUCCESS(status) {
+        return status;
+    }
+
+    let mut device: WDFDEVICE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(WdfDeviceCreate, device_init, WDF_NO_OBJECT_ATTRIBUTES, &mut device)
+    };
+    if !NT_SUCCESS(status) {
+        return status;
+    }
+
+    let mut device_config = ACX_DEVICE_CONFIG { Size: size_of::<ACX_DEVICE_CONFIG>() as u32, ..Default::default() };
+    unsafe { call_acx!(AcxDeviceInitialize, device, &mut device_config) }
 }
