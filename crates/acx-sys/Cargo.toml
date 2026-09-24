@@ -1,0 +1,13 @@
+[package]
+name = "acx-sys"
+edition.workspace = true
+version.workspace = true
+links = "acxstub"
+
+[dependencies]
+paste = "1.0.15"
+wdk-sys.workspace = true
+
+[build-dependencies]
+bindgen = "0.71.1"
+wdk-build.workspace = true

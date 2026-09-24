@@ -1,0 +1,53 @@
+; Kernel audio driver for the Native Instruments Audio Kontrol 1.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = ak1acx.cat
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+ak1acx.sys = 1,,
+
+[Manufacturer]
+%ProviderName% = Devices,NTamd64.10.0...16299
+
+[Devices.NTamd64.10.0...16299]
+%DeviceDesc% = Ak1_Device, USB\VID_17CC&PID_0815
+
+[Ak1_Device.NT]
+CopyFiles = Ak1_CopyFiles
+
+[Ak1_CopyFiles]
+ak1acx.sys
+
+[Ak1_Device.NT.Services]
+AddService = ak1acx, 0x00000002, Ak1_Service
+
+[Ak1_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\ak1acx.sys
+
+[Ak1_Device.NT.Wdf]
+KmdfService = ak1acx, Ak1_WdfSection
+
+[Ak1_WdfSection]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+ProviderName = "ak1-driver"
+DiskName     = "Audio Kontrol 1 driver installation disk"
+DeviceDesc   = "Audio Kontrol 1"
+ServiceDesc  = "Audio Kontrol 1 audio driver"
