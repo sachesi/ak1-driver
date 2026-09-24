@@ -1,11 +1,11 @@
 use ak1_proto::{
     DeviceSpec, EP_AUDIO_IN, EP_AUDIO_OUT, EP_CMD_IN, EP_CMD_OUT, MAX_PACKET_SIZE, Reply, STREAMING_ALT_SETTING,
-    get_device_info_request,
+    SampleRate, audio_params_request, get_device_info_request,
 };
 use wdk_sys::{
     _WDF_MEMORY_DESCRIPTOR_TYPE, _WDF_REQUEST_SEND_OPTIONS_FLAGS, _WdfUsbTargetDeviceSelectConfigType,
     _WdfUsbTargetDeviceSelectSettingType, NT_SUCCESS, NTSTATUS, STATUS_DEVICE_CONFIGURATION_ERROR,
-    STATUS_IO_TIMEOUT, ULONG, WDF_MEMORY_DESCRIPTOR, WDF_NO_OBJECT_ATTRIBUTES, WDF_REQUEST_SEND_OPTIONS,
+    STATUS_IO_TIMEOUT, STATUS_NOT_SUPPORTED, ULONG, WDF_MEMORY_DESCRIPTOR, WDF_NO_OBJECT_ATTRIBUTES, WDF_REQUEST_SEND_OPTIONS,
     WDF_USB_DEVICE_CREATE_CONFIG, WDF_USB_DEVICE_SELECT_CONFIG_PARAMS, WDF_USB_INTERFACE_SELECT_SETTING_PARAMS,
     WDF_USB_PIPE_INFORMATION, WDFDEVICE, WDFUSBDEVICE, WDFUSBINTERFACE, WDFUSBPIPE,
     call_unsafe_wdf_function_binding,
@@ -15,10 +15,10 @@ const USBD_CLIENT_CONTRACT_VERSION_602: ULONG = 0x602;
 const COMMAND_TIMEOUT_MS: i64 = 1000;
 const SYNC_TIMEOUT_MS: i64 = 100;
 const SYNC_ATTEMPTS: usize = 4;
+const REPLY_ATTEMPTS: usize = 8;
 
 pub struct Ak1Usb {
     pub device: WDFUSBDEVICE,
-    pub interface: WDFUSBINTERFACE,
     pub cmd_out: WDFUSBPIPE,
     pub cmd_in: WDFUSBPIPE,
     pub audio_in: WDFUSBPIPE,
@@ -72,7 +72,6 @@ impl Ak1Usb {
         let pipe = |address| unsafe { find_pipe(interface, address) };
         Ok(Ak1Usb {
             device: usb_device,
-            interface,
             cmd_out: pipe(EP_CMD_OUT)?,
             cmd_in: pipe(EP_CMD_IN)?,
             audio_in: pipe(EP_AUDIO_IN)?,
@@ -96,6 +95,19 @@ impl Ak1Usb {
                 }
                 Err(STATUS_IO_TIMEOUT) => {}
                 Err(status) => return Err(status),
+            }
+        }
+        Err(STATUS_IO_TIMEOUT)
+    }
+
+    pub unsafe fn set_audio_params(&self, rate: SampleRate, max_packet_bytes: u16) -> Result<(), NTSTATUS> {
+        unsafe { self.send(&audio_params_request(rate, max_packet_bytes))? };
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        // Unsolicited input reports may arrive before the answer.
+        for _ in 0..REPLY_ATTEMPTS {
+            let len = unsafe { self.receive(&mut buf, COMMAND_TIMEOUT_MS)? };
+            if let Some(Reply::AudioParams { accepted }) = Reply::parse(&buf[..len]) {
+                return if accepted { Ok(()) } else { Err(STATUS_NOT_SUPPORTED) };
             }
         }
         Err(STATUS_IO_TIMEOUT)
