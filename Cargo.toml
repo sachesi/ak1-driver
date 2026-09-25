@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["asio", "crates/acx-sys", "crates/ak1-proto", "driver/ak1-acx", "panel", "tools/ak1-asio-host", "tools/ak1-probe"]
+members = ["asio", "crates/acx-sys", "crates/ak1-proto", "driver/ak1-acx", "panel", "setup", "tools/ak1-asio-host", "tools/ak1-probe"]
 
 [workspace.package]
 edition = "2024"

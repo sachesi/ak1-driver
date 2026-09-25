@@ -1,0 +1,8 @@
+[package]
+name = "ak1-setup"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_Shell"] }

@@ -24,13 +24,15 @@ The knob, buttons, LEDs and MIDI ports are not supported yet.
 
 ## Install
 
-Build a bundle (see below), copy `target\bundle` to the machine, then in an
-administrator PowerShell 7 in that directory:
-
-```powershell
-.\install.ps1              # trusts the certificate, installs the driver, registers ASIO, adds the panel
-.\install.ps1 -Uninstall   # removes all of it again
-```
+Build a bundle (see below) and run `ak1-setup.exe` from it on the machine; it
+is the only file needed, and asks whether to install or uninstall
+(`/install` and `/uninstall` skip the question). Installing turns test signing
+on if Secure Boot allows it (which takes a restart), extracts the driver
+package to `C:\ak1`, trusts its certificate and installs the driver from
+there, puts the ASIO driver and the control panel in
+`C:\Program Files\Audio Kontrol 1` and adds the panel to the Start menu.
+Uninstalling, also from "Audio Kontrol 1 driver" in Settings > Apps, removes
+all of it again except test signing.
 
 Plug the card in afterwards. The endpoints all appear as "Line (Audio Kontrol 1)",
 because Windows ignores the names ACX offers for them; rename them in Sound

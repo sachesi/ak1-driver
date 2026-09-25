@@ -72,6 +72,13 @@ name = "ak1-proto"
 version = "0.1.0"
 
 [[package]]
+name = "ak1-setup"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
