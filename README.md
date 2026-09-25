@@ -1,7 +1,7 @@
 # Audio Kontrol 1 driver for Windows 11
 
 A driver for the Native Instruments Audio Kontrol 1 (USB 17cc:0815), which has
-no vendor driver for current Windows. It is written in Rust and has two parts:
+no vendor driver for current Windows. It is written in Rust:
 
 - `ak1acx.sys`, a kernel driver built on KMDF and the Audio Class Extension
   (ACX). It exposes outputs 1/2, outputs 3/4 and inputs 1/2 as Windows audio
@@ -10,6 +10,7 @@ no vendor driver for current Windows. It is written in Rust and has two parts:
   exclusive mode.
 - `ak1-panel.exe`, a control panel for the ASIO settings, the device status
   and output and input tests.
+- `ak1-setup.exe`, which carries the other three and installs or removes them.
 
 The knob, buttons, LEDs and MIDI ports are not supported yet.
 
@@ -52,24 +53,26 @@ driver open is asked to reload it when the buffer size changes. DAWs are
 offered the sizes that work at the current rate: 64 to 2048 samples at 44.1
 and 48 kHz, 128 to 4096 at 88.2 and 96 kHz, 256 to 8192 at 192 kHz. DAWs that
 list the sizes only once, such as Ardour, get the list for the panel's rate.
-It also shows
-whether the card is working, the driver and firmware versions and the error
-counts of the last stream, plays a test tone on either output pair and meters
-the inputs. While the meter is on it holds the card at the Windows sample
-rate.
+The panel also shows whether the card is working, the driver and firmware
+versions and the error counts of the last stream, plays a test tone on either
+output pair and meters the inputs. While the meter is on it holds the card at
+the Windows sample rate.
 
 The front phones output sums left and right and follows the 1/2 - 3/4 selector
 next to it. The output 1/2 and 3/4 level knobs only affect the rear outputs.
 
-USB passthrough in a QEMU virtual machine distorts playback, even though
-nothing is lost on the guest side. Run it on real hardware.
+USB passthrough in a QEMU virtual machine loses audio packets and distorts
+playback. Run it on real hardware.
 
 ## Building
 
 Needs the WDK and SDK 10.0.26100, LLVM (set `LIBCLANG_PATH` to its `bin`
-directory) and a code signing certificate in `Cert:\CurrentUser\My`.
+directory) and a code signing certificate in `Cert:\CurrentUser\My`. A
+self-signed one is enough for test signing:
 
 ```powershell
+New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ak1-driver test signing' `
+    -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(5)
 .\scripts\package-driver.ps1 -CertThumbprint <sha1>           # debug driver package
 .\scripts\make-bundle.ps1 -CertThumbprint <sha1>              # release bundle in target\bundle
 cargo test --workspace
@@ -88,6 +91,16 @@ ak1-probe identify output12            # low tone left, then high tone right
 ak1-asio-host 48000 pref 10 out1,out2  # 10 s of ASIO on outputs 1/2
 ak1-asio-host panel                    # what a DAW's ASIO settings button does
 ```
+
+## Credits
+
+The Linux snd-usb-caiaq driver by Daniel Mack served as the reference for the
+card's USB protocol; no code was taken from it. Microsoft's USB Audio 2.0 ACX
+sample driver served as the reference for using ACX.
+
+Native Instruments and Audio Kontrol are trademarks of Native Instruments GmbH,
+and ASIO is a trademark of Steinberg Media Technologies GmbH. This project is
+not affiliated with or endorsed by either.
 
 ## License
 
