@@ -118,6 +118,9 @@ fn install(paths: &Paths) -> Result<()> {
     }
     println!("Trusting the driver's certificate");
     trust_certificate(embedded(CERTIFICATE).unwrap_or_default())?;
+    // Windows keeps the card on an installed package with a higher version,
+    // so this build's driver would not take over from a newer one.
+    restart |= remove_driver_packages()?;
     println!("Installing the driver");
     match run(Command::new("pnputil").arg("/add-driver").arg(paths.driver.join(INF)).arg("/install"))? {
         // 259: no Audio Kontrol 1 is plugged in.
@@ -175,13 +178,7 @@ fn uninstall(paths: &Paths) -> Result<()> {
     }
     remove_dir(&paths.programs)?;
 
-    for published in published_driver_packages()? {
-        println!("Removing driver package {published}");
-        match run(Command::new("pnputil").args(["/delete-driver", &published, "/uninstall"]))? {
-            0 | 3010 => {}
-            code => return Err(format!("pnputil /delete-driver {published} failed with exit code {code}").into()),
-        }
-    }
+    let restart = remove_driver_packages()?;
     let certificate = match embedded(CERTIFICATE) {
         Some(certificate) => Some(certificate.to_vec()),
         None => std::fs::read(paths.driver.join(CERTIFICATE)).ok(),
@@ -196,8 +193,13 @@ fn uninstall(paths: &Paths) -> Result<()> {
         status.ok()?;
     }
 
-    println!("Removed. Test signing is still on: if no other driver needs it, turn it off");
-    println!("with \"bcdedit /set testsigning off\" and turn Secure Boot back on.");
+    if restart {
+        println!("Removed. Restart Windows to finish.");
+    } else {
+        println!("Removed.");
+    }
+    println!("Test signing is still on: if no other driver needs it, turn it off with");
+    println!("\"bcdedit /set testsigning off\" and turn Secure Boot back on.");
     Ok(())
 }
 
@@ -224,6 +226,21 @@ fn enable_test_signing() -> Result<bool> {
         0 => Ok(true),
         code => Err(format!("bcdedit /set testsigning on failed with exit code {code}").into()),
     }
+}
+
+/// Removes the installed Audio Kontrol 1 driver packages and returns whether
+/// Windows has to restart to finish.
+fn remove_driver_packages() -> Result<bool> {
+    let mut restart = false;
+    for published in published_driver_packages()? {
+        println!("Removing driver package {published}");
+        match run(Command::new("pnputil").args(["/delete-driver", &published, "/uninstall"]))? {
+            0 => {}
+            3010 => restart = true,
+            code => return Err(format!("pnputil /delete-driver {published} failed with exit code {code}").into()),
+        }
+    }
+    Ok(restart)
 }
 
 /// Published names (oem<n>.inf) of the installed Audio Kontrol 1 driver
