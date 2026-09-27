@@ -1,0 +1,17 @@
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable, and wdk-build requires it too" },
+]
+
+[licenses]
+allow = ["Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

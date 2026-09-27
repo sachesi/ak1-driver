@@ -79,6 +79,7 @@ New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ak1-driver test sig
 .\scripts\package-driver.ps1 -CertThumbprint <sha1>           # debug driver package
 .\scripts\make-bundle.ps1 -CertThumbprint <sha1>              # release bundle in target\bundle
 cargo test --workspace
+cargo deny check                                              # advisories, licenses, sources
 ```
 
 ## Tools
