@@ -271,7 +271,7 @@ impl Engine {
         let completed = qpc_now();
         let last = captured.len() as u64 - 1;
         let offset = unsafe {
-            audio.process(|frames| {
+            audio.process(self.rate_hz, |frames| {
                 let codec = &mut *self.codec.get();
                 let mut offset = 0;
                 for (i, packet) in captured.iter().enumerate() {

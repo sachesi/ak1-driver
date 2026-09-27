@@ -1,7 +1,8 @@
 //! Ties the ACX streams and the ASIO session to the USB engine, which plays
-//! their sum. The device has one clock, so the first stream fixes the sample
-//! rate for all others until every stream is gone, and the engine runs while
-//! any stream is prepared and the device is in D0.
+//! their sum. The device has one clock: an ASIO session sets its rate,
+//! otherwise the first stream does, until every stream is gone. Streams at
+//! other rates are resampled. The engine runs while any stream is prepared
+//! and the device is in D0.
 
 extern crate alloc;
 
@@ -11,8 +12,8 @@ use core::cell::{Cell, UnsafeCell};
 use ak1_proto::{DeviceSpec, SampleRate};
 use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
 use wdk_sys::{
-    KSPIN_LOCK, NTSTATUS, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY, STATUS_INVALID_DEVICE_STATE,
-    STATUS_NOT_SUPPORTED, WDFDEVICE, WDFFILEOBJECT, WDFWAITLOCK, call_unsafe_wdf_function_binding,
+    KSPIN_LOCK, NTSTATUS, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY, STATUS_INVALID_DEVICE_STATE, WDFDEVICE,
+    WDFFILEOBJECT, WDFWAITLOCK, call_unsafe_wdf_function_binding,
 };
 
 use crate::asio::Session;
@@ -50,6 +51,7 @@ pub struct Audio {
 
 pub struct Frames<'a> {
     audio: &'a Audio,
+    rate_hz: u32,
     qpc: Cell<u64>,
 }
 
@@ -74,19 +76,13 @@ impl Audio {
         hardware.spec = Some(spec);
     }
 
-    /// Reserves the device clock for a new stream at `rate`.
-    pub unsafe fn claim_rate(&self, rate: SampleRate) -> Result<(), NTSTATUS> {
+    /// Counts a new stream, whose rate becomes the device's if it has none yet.
+    pub unsafe fn claim_rate(&self, rate: SampleRate) {
         unsafe {
             self.with_lock(|| {
                 let shared = &mut *self.shared.get();
-                match shared.rate {
-                    Some(current) if current != rate => Err(STATUS_NOT_SUPPORTED),
-                    _ => {
-                        shared.rate = Some(rate);
-                        shared.streams += 1;
-                        Ok(())
-                    }
-                }
+                shared.rate.get_or_insert(rate);
+                shared.streams += 1;
             })
         }
     }
@@ -108,7 +104,8 @@ impl Audio {
         let hardware = unsafe { &mut *self.hardware.get() };
         unsafe { stream.reset() };
         if hardware.engine.is_none() {
-            unsafe { self.start_engine(hardware, stream.rate)? };
+            let rate = unsafe { self.with_lock(|| (*self.shared.get()).rate) }.unwrap_or(stream.rate);
+            unsafe { self.start_engine(hardware, rate)? };
         }
         hardware.prepared += 1;
         Ok(())
@@ -124,18 +121,42 @@ impl Audio {
         }
     }
 
-    /// Starts the ASIO driver's session; there is one at a time.
+    /// Starts the ASIO driver's session; there is one at a time. It sets the
+    /// device's rate, restarting the engine if that changes; the streams
+    /// already running are resampled from then on.
     pub unsafe fn start_asio(&self, session: Box<Session>, rate: SampleRate) -> Result<(), NTSTATUS> {
         let _guard = unsafe { self.lock_control() };
         if unsafe { self.with_lock(|| (*self.asio.get()).is_some()) } {
             return Err(STATUS_DEVICE_BUSY);
         }
-        unsafe { self.claim_rate(rate)? };
+        let previous = unsafe {
+            self.with_lock(|| {
+                let shared = &mut *self.shared.get();
+                shared.streams += 1;
+                shared.rate.replace(rate)
+            })
+        };
         let hardware = unsafe { &mut *self.hardware.get() };
+        if previous != Some(rate) {
+            unsafe { self.stop_engine(hardware) };
+        }
         if hardware.engine.is_none()
             && let Err(status) = unsafe { self.start_engine(hardware, rate) }
         {
-            unsafe { self.release_rate() };
+            let restored = unsafe {
+                self.with_lock(|| {
+                    let shared = &mut *self.shared.get();
+                    shared.streams -= 1;
+                    shared.rate = if shared.streams == 0 { None } else { previous };
+                    shared.rate
+                })
+            };
+            // Streams that were playing at the old rate keep playing.
+            if let Some(restored) = restored
+                && hardware.prepared > 0
+            {
+                let _ = unsafe { self.start_engine(hardware, restored) };
+            }
             return Err(status);
         }
         hardware.prepared += 1;
@@ -230,9 +251,10 @@ impl Audio {
         unsafe { self.with_lock(|| stream.position()) }
     }
 
-    /// Runs `process` with the running streams while holding the audio lock.
-    pub unsafe fn process<R>(&self, process: impl FnOnce(&Frames) -> R) -> R {
-        unsafe { self.with_lock(|| process(&Frames { audio: self, qpc: Cell::new(0) })) }
+    /// Runs `process` with the running streams while holding the audio lock;
+    /// the device runs at `rate_hz`.
+    pub unsafe fn process<R>(&self, rate_hz: u32, process: impl FnOnce(&Frames) -> R) -> R {
+        unsafe { self.with_lock(|| process(&Frames { audio: self, rate_hz, qpc: Cell::new(0) })) }
     }
 
     unsafe fn with_lock<R>(&self, f: impl FnOnce() -> R) -> R {
@@ -277,7 +299,7 @@ impl Frames<'_> {
         let mut frame = self.asio(Session::render).unwrap_or([0; 4]);
         for (slot, first) in [(Slot::Output12, 0), (Slot::Output34, 2)] {
             if let Some(stream) = self.stream(slot) {
-                let [left, right] = unsafe { stream.render_frame(self.qpc.get()) };
+                let [left, right] = unsafe { stream.render(self.rate_hz, self.qpc.get()) };
                 frame[first] += left;
                 frame[first + 1] += right;
             }
@@ -289,7 +311,7 @@ impl Frames<'_> {
     pub fn capture(&self, samples: [i32; 2]) {
         self.asio(|session| session.capture(samples));
         if let Some(stream) = self.stream(Slot::Input12) {
-            unsafe { stream.capture_frame(samples, self.qpc.get()) };
+            unsafe { stream.capture(samples, self.rate_hz, self.qpc.get()) };
         }
     }
 }

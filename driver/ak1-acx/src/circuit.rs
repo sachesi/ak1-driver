@@ -259,7 +259,7 @@ unsafe fn create_stream(
     check(unsafe { call_acx!(AcxStreamInitAssignAcxRtStreamCallbacks, *init, &mut rt_callbacks) })?;
     unsafe { call_acx!(AcxStreamInitSetAcxRtStreamSupportsNotifications, *init) };
 
-    unsafe { context.audio.claim_rate(rate)? };
+    unsafe { context.audio.claim_rate(rate) };
     let mut attributes = WDF_OBJECT_ATTRIBUTES {
         ContextTypeInfo: &STREAM_CONTEXT_TYPE.0,
         EvtDestroyCallback: Some(evt_stream_destroy),

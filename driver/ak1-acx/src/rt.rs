@@ -2,11 +2,15 @@
 //! of packets; the USB engine moves frames in and out of it and reports each
 //! finished packet, so the device clock paces the stream.
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use acx_sys::{ACX_RTPACKET, ACXSTREAM, PACX_RTPACKET, call_acx};
 use ak1_proto::SampleRate;
+use ak1_proto::resample::Resampler;
 use wdk_sys::ntddk::{
     ExAllocatePool2, ExFreePool, IoAllocateMdl, IoFreeMdl, KeQueryPerformanceCounter, MmBuildMdlForNonPagedPool,
 };
@@ -61,6 +65,9 @@ pub struct RtStream {
     ring: UnsafeCell<Ring>,
     /// Guarded by the audio lock.
     cursor: UnsafeCell<Cursor>,
+    /// Converts between the stream's rate and the card's when they differ.
+    /// Guarded by the audio lock.
+    resampler: UnsafeCell<Box<Resampler<2>>>,
     current_packet: AtomicU32,
     last_packet_start_qpc: AtomicU64,
 }
@@ -72,6 +79,7 @@ impl RtStream {
             slot,
             rate,
             audio,
+            resampler: UnsafeCell::new(Resampler::boxed()),
             container_bytes: container_bits as usize / 8,
             ring: UnsafeCell::new(Ring {
                 buffers: [core::ptr::null_mut(); MAX_PACKETS],
@@ -89,8 +97,44 @@ impl RtStream {
         2 * self.container_bytes
     }
 
+    /// The next frame to play at `card_hz`, converted from the stream's rate
+    /// if that differs. Caller holds the audio lock.
+    pub unsafe fn render(&self, card_hz: u32, qpc: u64) -> [i32; 2] {
+        let hz = self.rate.hz();
+        if hz == card_hz {
+            return unsafe { self.render_frame(qpc) };
+        }
+        let resampler = unsafe { &mut *self.resampler.get() };
+        if resampler.rates() != (hz, card_hz) {
+            resampler.reset(hz, card_hz);
+        }
+        loop {
+            if let Some(frame) = resampler.pop() {
+                return frame;
+            }
+            resampler.push(unsafe { self.render_frame(qpc) });
+        }
+    }
+
+    /// Takes a frame captured at `card_hz`, converted to the stream's rate if
+    /// that differs. Caller holds the audio lock.
+    pub unsafe fn capture(&self, samples: [i32; 2], card_hz: u32, qpc: u64) {
+        let hz = self.rate.hz();
+        if hz == card_hz {
+            return unsafe { self.capture_frame(samples, qpc) };
+        }
+        let resampler = unsafe { &mut *self.resampler.get() };
+        if resampler.rates() != (card_hz, hz) {
+            resampler.reset(card_hz, hz);
+        }
+        resampler.push(samples);
+        while let Some(frame) = resampler.pop() {
+            unsafe { self.capture_frame(frame, qpc) };
+        }
+    }
+
     /// Reads the next render frame as 24-bit samples. Caller holds the audio lock.
-    pub unsafe fn render_frame(&self, qpc: u64) -> [i32; 2] {
+    unsafe fn render_frame(&self, qpc: u64) -> [i32; 2] {
         let Some(frame) = (unsafe { self.frame_bytes() }) else { return [0; 2] };
         let sample = |i: usize| {
             let at = unsafe { frame.add(i * self.container_bytes) };
@@ -106,7 +150,7 @@ impl RtStream {
     }
 
     /// Stores the next capture frame from 24-bit samples. Caller holds the audio lock.
-    pub unsafe fn capture_frame(&self, samples: [i32; 2], qpc: u64) {
+    unsafe fn capture_frame(&self, samples: [i32; 2], qpc: u64) {
         if let Some(frame) = unsafe { self.frame_bytes() } {
             for (i, sample) in samples.into_iter().enumerate() {
                 let at = unsafe { frame.add(i * self.container_bytes) };
@@ -166,6 +210,7 @@ impl RtStream {
         cursor.frames = 0;
         cursor.qpc = 0;
         cursor.packet_start_qpc = 0;
+        unsafe { (*self.resampler.get()).clear() };
         self.current_packet.store(0, Ordering::Release);
         self.last_packet_start_qpc.store(0, Ordering::Release);
     }
