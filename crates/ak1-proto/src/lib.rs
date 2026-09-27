@@ -11,6 +11,9 @@
 
 #![no_std]
 
+extern crate alloc;
+
+pub mod asio;
 pub mod mode2;
 
 pub const VENDOR_ID: u16 = 0x17cc;

@@ -1,5 +1,5 @@
-//! ASIO 2 driver for the Native Instruments Audio Kontrol 1, running on top of
-//! the kernel driver's audio endpoints.
+//! ASIO 2 driver for the Native Instruments Audio Kontrol 1, streaming
+//! through the kernel driver alongside its Windows audio endpoints.
 
 pub mod abi;
 mod driver;
@@ -23,7 +23,6 @@ use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_core::{BOOL, GUID, HRESULT, HSTRING, IUnknown, Interface, PCWSTR, Ref, implement};
 
 pub use driver::{CLSID, DRIVER_NAME};
-pub use duplex::{Endpoints, find_endpoints};
 
 static MODULE: AtomicIsize = AtomicIsize::new(0);
 static OBJECTS: AtomicU32 = AtomicU32::new(0);

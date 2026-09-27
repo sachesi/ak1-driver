@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(not(test))]
 extern crate wdk_panic;
 
+mod asio;
 mod audio;
 mod circuit;
 mod ks;
@@ -20,11 +21,12 @@ use wdk::println;
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
-    _WDF_EXECUTION_LEVEL, _WDF_POWER_DEVICE_STATE, _WDF_SYNCHRONIZATION_SCOPE, ACCESS_MASK, KEY_SET_VALUE, NT_SUCCESS, NTSTATUS,
-    PCUNICODE_STRING, PDRIVER_OBJECT, PLUGPLAY_REGKEY_DEVICE, PWDFDEVICE_INIT, REG_BINARY, REG_DWORD,
-    STATUS_NOT_SUPPORTED, STATUS_SUCCESS, UNICODE_STRING, WDF_DRIVER_CONFIG, WDF_NO_OBJECT_ATTRIBUTES,
-    WDF_OBJECT_ATTRIBUTES, WDF_OBJECT_CONTEXT_TYPE_INFO, WDF_PNPPOWER_EVENT_CALLBACKS, WDFCMRESLIST, WDFDEVICE,
-    WDF_POWER_DEVICE_STATE, WDFDRIVER, WDFKEY, WDFWAITLOCK, call_unsafe_wdf_function_binding,
+    _WDF_EXECUTION_LEVEL, _WDF_FILEOBJECT_CLASS, _WDF_POWER_DEVICE_STATE, _WDF_SYNCHRONIZATION_SCOPE, _WDF_TRI_STATE,
+    ACCESS_MASK, KEY_SET_VALUE, NT_SUCCESS, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PLUGPLAY_REGKEY_DEVICE,
+    PWDFDEVICE_INIT, REG_BINARY, REG_DWORD, STATUS_NOT_SUPPORTED, STATUS_SUCCESS, UNICODE_STRING, WDF_DRIVER_CONFIG,
+    WDF_FILEOBJECT_CONFIG, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_OBJECT_CONTEXT_TYPE_INFO,
+    WDF_PNPPOWER_EVENT_CALLBACKS, WDF_POWER_DEVICE_STATE, WDFCMRESLIST, WDFDEVICE, WDFDRIVER, WDFKEY, WDFOBJECT,
+    WDFWAITLOCK, call_unsafe_wdf_function_binding,
 };
 
 use crate::audio::Audio;
@@ -67,6 +69,7 @@ static STREAM_CONTEXT_TYPE: ContextTypeInfo = ContextTypeInfo(WDF_OBJECT_CONTEXT
 // Values under the device's hardware key.
 static FIRMWARE_VERSION_VALUE: [u16; 15] = utf16(b"FirmwareVersion");
 static STREAM_STATS_VALUE: [u16; 11] = utf16(b"StreamStats");
+static ASIO_STATS_VALUE: [u16; 9] = utf16(b"AsioStats");
 
 /// # Safety
 ///
@@ -124,6 +127,27 @@ unsafe fn add_device(device_init: &mut PWDFDEVICE_INIT) -> Result<(), NTSTATUS> 
         call_unsafe_wdf_function_binding!(WdfDeviceInitSetPnpPowerEventCallbacks, *device_init, &mut pnp_callbacks)
     };
 
+    // Ends the ASIO session of a handle that closes without stopping it.
+    let mut file_config = WDF_FILEOBJECT_CONFIG {
+        Size: size_of::<WDF_FILEOBJECT_CONFIG>() as u32,
+        AutoForwardCleanupClose: _WDF_TRI_STATE::WdfUseDefault,
+        FileObjectClass: _WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts,
+        ..Default::default()
+    };
+    let mut attributes = WDF_OBJECT_ATTRIBUTES {
+        EvtCleanupCallback: Some(evt_file_cleanup),
+        ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
+        ..wdf::object_attributes(core::ptr::null_mut())
+    };
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetFileObjectConfig,
+            *device_init,
+            &mut file_config,
+            &mut attributes
+        )
+    };
+
     let mut attributes = WDF_OBJECT_ATTRIBUTES {
         ContextTypeInfo: &DEVICE_CONTEXT_TYPE.0,
         ..wdf::object_attributes(core::ptr::null_mut())
@@ -149,6 +173,11 @@ unsafe fn add_device(device_init: &mut PWDFDEVICE_INIT) -> Result<(), NTSTATUS> 
     let circuits = unsafe { circuit::create_all(device)? };
     unsafe { (*device_context(device)).circuits = circuits };
     Ok(())
+}
+
+extern "C" fn evt_file_cleanup(file: WDFOBJECT) {
+    let device = unsafe { call_unsafe_wdf_function_binding!(WdfFileObjectGetDevice, file.cast()) };
+    unsafe { (*device_context(device)).audio.stop_asio(file.cast()) };
 }
 
 extern "C" fn evt_prepare_hardware(device: WDFDEVICE, _raw: WDFCMRESLIST, _translated: WDFCMRESLIST) -> NTSTATUS {
@@ -236,6 +265,14 @@ unsafe fn record_stream_stats(device: WDFDEVICE, stats: &Stats) {
     let bytes: [u8; 36] = unsafe { core::mem::transmute(snapshot) };
     if let Ok(key) = unsafe { DeviceKey::open(device, KEY_SET_VALUE) } {
         let _ = unsafe { key.assign(&STREAM_STATS_VALUE, &bytes, REG_BINARY) };
+    }
+}
+
+/// Leaves the last ASIO session's counters of late frames under the device key.
+unsafe fn record_asio_stats(device: WDFDEVICE, stats: [u32; 2]) {
+    let bytes: [u8; 8] = unsafe { core::mem::transmute(stats) };
+    if let Ok(key) = unsafe { DeviceKey::open(device, KEY_SET_VALUE) } {
+        let _ = unsafe { key.assign(&ASIO_STATS_VALUE, &bytes, REG_BINARY) };
     }
 }
 

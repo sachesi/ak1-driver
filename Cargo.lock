@@ -38,6 +38,7 @@ dependencies = [
 name = "ak1-asio"
 version = "0.1.0"
 dependencies = [
+ "ak1-proto",
  "windows 0.62.2",
  "windows-core 0.62.2",
 ]

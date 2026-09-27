@@ -1,6 +1,7 @@
 //! Audio circuits: one stereo render circuit per output pair and one stereo
 //! capture circuit for the inputs. Their names are the reference strings of
-//! the device interfaces in the INF.
+//! the device interfaces in the INF. The Output12 circuit also carries the
+//! ASIO driver's property set.
 
 extern crate alloc;
 
@@ -113,6 +114,9 @@ unsafe fn create_from_init(
         check(call_acx!(AcxCircuitInitAssignName, *init, &name))?;
         call_acx!(AcxCircuitInitSetCircuitType, *init, circuit_type);
         check(call_acx!(AcxCircuitInitAssignAcxCreateStreamCallback, *init, Some(evt_create_stream)))?;
+        if slot == Slot::Output12 {
+            check(crate::asio::assign_properties(*init))?;
+        }
     }
     let mut power: ACX_CIRCUIT_PNPPOWER_CALLBACKS = unsafe { core::mem::zeroed() };
     power.Size = size_of::<ACX_CIRCUIT_PNPPOWER_CALLBACKS>() as u32;

@@ -1,7 +1,7 @@
-//! Ties the ACX streams to the USB engine. The device has one clock, so the
-//! first stream fixes the sample rate for all others until every stream is
-//! gone, and the engine runs while any stream is prepared and the device is
-//! in D0.
+//! Ties the ACX streams and the ASIO session to the USB engine, which plays
+//! their sum. The device has one clock, so the first stream fixes the sample
+//! rate for all others until every stream is gone, and the engine runs while
+//! any stream is prepared and the device is in D0.
 
 extern crate alloc;
 
@@ -11,13 +11,17 @@ use core::cell::{Cell, UnsafeCell};
 use ak1_proto::{DeviceSpec, SampleRate};
 use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
 use wdk_sys::{
-    KSPIN_LOCK, NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_NOT_SUPPORTED, WDFDEVICE, WDFWAITLOCK,
-    call_unsafe_wdf_function_binding,
+    KSPIN_LOCK, NTSTATUS, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY, STATUS_INVALID_DEVICE_STATE,
+    STATUS_NOT_SUPPORTED, WDFDEVICE, WDFFILEOBJECT, WDFWAITLOCK, call_unsafe_wdf_function_binding,
 };
 
+use crate::asio::Session;
 use crate::rt::{RtStream, Slot};
 use crate::stream::Engine;
 use crate::usb::Ak1Usb;
+
+const MAX_SAMPLE: i32 = (1 << 23) - 1;
+const MIN_SAMPLE: i32 = -(1 << 23);
 
 struct Shared {
     streams: u32,
@@ -36,11 +40,12 @@ pub struct Audio {
     /// Serializes engine start and stop, which happen at PASSIVE_LEVEL.
     control: WDFWAITLOCK,
     hardware: UnsafeCell<Hardware>,
-    /// Guards `shared`, `running` and everything the engine touches while it
-    /// processes a transfer.
+    /// Guards `shared`, `running`, `asio` and everything the engine touches
+    /// while it processes a transfer.
     lock: UnsafeCell<KSPIN_LOCK>,
     shared: UnsafeCell<Shared>,
     running: UnsafeCell<[*const RtStream; 3]>,
+    asio: UnsafeCell<Option<Box<Session>>>,
 }
 
 pub struct Frames<'a> {
@@ -57,6 +62,7 @@ impl Audio {
             lock: UnsafeCell::new(0),
             shared: UnsafeCell::new(Shared { streams: 0, rate: None }),
             running: UnsafeCell::new([core::ptr::null(); 3]),
+            asio: UnsafeCell::new(None),
         }
     }
 
@@ -115,6 +121,60 @@ impl Audio {
         hardware.prepared = hardware.prepared.saturating_sub(1);
         if hardware.prepared == 0 {
             unsafe { self.stop_engine(hardware) };
+        }
+    }
+
+    /// Starts the ASIO driver's session; there is one at a time.
+    pub unsafe fn start_asio(&self, session: Box<Session>, rate: SampleRate) -> Result<(), NTSTATUS> {
+        let _guard = unsafe { self.lock_control() };
+        if unsafe { self.with_lock(|| (*self.asio.get()).is_some()) } {
+            return Err(STATUS_DEVICE_BUSY);
+        }
+        unsafe { self.claim_rate(rate)? };
+        let hardware = unsafe { &mut *self.hardware.get() };
+        if hardware.engine.is_none()
+            && let Err(status) = unsafe { self.start_engine(hardware, rate) }
+        {
+            unsafe { self.release_rate() };
+            return Err(status);
+        }
+        hardware.prepared += 1;
+        unsafe { self.with_lock(|| *self.asio.get() = Some(session)) };
+        Ok(())
+    }
+
+    /// Ends the session `owner` started, if any.
+    pub unsafe fn stop_asio(&self, owner: WDFFILEOBJECT) {
+        let take = || unsafe {
+            self.with_lock(|| {
+                let slot = &mut *self.asio.get();
+                if slot.as_ref().is_some_and(|s| s.owner == owner) { slot.take() } else { None }
+            })
+        };
+        // Every handle to the device is cleaned up through here, and most
+        // never started a session; those should not wait for the control lock.
+        if unsafe { self.with_lock(|| (*self.asio.get()).as_ref().is_none_or(|s| s.owner != owner)) } {
+            return;
+        }
+        let _guard = unsafe { self.lock_control() };
+        let Some(session) = take() else { return };
+        unsafe { crate::record_asio_stats(self.device, session.stats()) };
+        drop(session);
+        let hardware = unsafe { &mut *self.hardware.get() };
+        hardware.prepared = hardware.prepared.saturating_sub(1);
+        if hardware.prepared == 0 {
+            unsafe { self.stop_engine(hardware) };
+        }
+        unsafe { self.release_rate() };
+    }
+
+    /// Runs `f` on the session `owner` started.
+    pub unsafe fn with_asio<R>(&self, owner: WDFFILEOBJECT, f: impl FnOnce(&mut Session) -> R) -> Result<R, NTSTATUS> {
+        unsafe {
+            self.with_lock(|| match (*self.asio.get()).as_deref_mut() {
+                Some(session) if session.owner == owner => Ok(f(session)),
+                _ => Err(STATUS_INVALID_DEVICE_STATE),
+            })
         }
     }
 
@@ -207,15 +267,27 @@ impl Frames<'_> {
         unsafe { stream.as_ref() }
     }
 
-    /// Next playback frame for both output pairs, silence where no stream runs.
+    fn asio<R>(&self, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
+        unsafe { (*self.audio.asio.get()).as_deref_mut() }.map(f)
+    }
+
+    /// Next playback frame of all four outputs: the ASIO output plus each
+    /// pair's stream, silence where nothing plays.
     pub fn render(&self) -> [i32; 4] {
-        let [a, b] = self.stream(Slot::Output12).map_or([0; 2], |s| unsafe { s.render_frame(self.qpc.get()) });
-        let [c, d] = self.stream(Slot::Output34).map_or([0; 2], |s| unsafe { s.render_frame(self.qpc.get()) });
-        [a, b, c, d]
+        let mut frame = self.asio(Session::render).unwrap_or([0; 4]);
+        for (slot, first) in [(Slot::Output12, 0), (Slot::Output34, 2)] {
+            if let Some(stream) = self.stream(slot) {
+                let [left, right] = unsafe { stream.render_frame(self.qpc.get()) };
+                frame[first] += left;
+                frame[first + 1] += right;
+            }
+        }
+        frame.map(|sample| sample.clamp(MIN_SAMPLE, MAX_SAMPLE))
     }
 
     /// Delivers a captured frame of inputs 1/2.
     pub fn capture(&self, samples: [i32; 2]) {
+        self.asio(|session| session.capture(samples));
         if let Some(stream) = self.stream(Slot::Input12) {
             unsafe { stream.capture_frame(samples, self.qpc.get()) };
         }

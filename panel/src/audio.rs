@@ -6,16 +6,20 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ak1_asio::{Endpoints, find_endpoints};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_SHAREMODE_SHARED, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE,
+    AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IConnector,
+    IDeviceTopology, IMMDevice, IMMDeviceEnumerator, IPart, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    eCapture, eRender,
 };
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
-use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
+use windows::core::Interface;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+const USB_VID_PID: &str = "vid_17cc&pid_0815";
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
 const BUFFER_HNS: i64 = 1_000_000;
 const LEVEL: f64 = 0.25;
@@ -191,6 +195,56 @@ fn describe(format: *const WAVEFORMATEX) -> (u32, usize, bool) {
     let float = f.wFormatTag == WAVE_FORMAT_IEEE_FLOAT as u16
         || (f.wFormatTag == WAVE_FORMAT_EXTENSIBLE && sub_format() == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
     (f.nSamplesPerSec, usize::from(f.nChannels), float && f.wBitsPerSample == 32)
+}
+
+struct Endpoints {
+    output12: IMMDevice,
+    output34: IMMDevice,
+    input12: IMMDevice,
+}
+
+/// Finds the endpoints whose KS filter is one of the card's circuits.
+fn find_endpoints() -> windows::core::Result<Option<Endpoints>> {
+    let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+    let (mut output12, mut output34, mut input12) = (None, None, None);
+    for flow in [eRender, eCapture] {
+        let collection = unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)? };
+        for i in 0..unsafe { collection.GetCount()? } {
+            let device = unsafe { collection.Item(i)? };
+            let Ok(filter) = filter_path(&device) else { continue };
+            let filter = filter.to_ascii_lowercase();
+            if !filter.contains(USB_VID_PID) {
+                continue;
+            }
+            let slot = if filter.ends_with("\\output12") {
+                &mut output12
+            } else if filter.ends_with("\\output34") {
+                &mut output34
+            } else if filter.ends_with("\\input12") {
+                &mut input12
+            } else {
+                continue;
+            };
+            *slot = Some(device);
+        }
+    }
+    Ok(match (output12, output34, input12) {
+        (Some(output12), Some(output34), Some(input12)) => Some(Endpoints { output12, output34, input12 }),
+        _ => None,
+    })
+}
+
+/// Device path of the KS filter behind an endpoint, whose reference string
+/// is the circuit name.
+fn filter_path(device: &IMMDevice) -> windows::core::Result<String> {
+    let topology: IDeviceTopology = unsafe { device.Activate(CLSCTX_ALL, None)? };
+    let connector = unsafe { topology.GetConnector(0)? };
+    let connected: IConnector = unsafe { connector.GetConnectedTo()? };
+    let part: IPart = connected.cast()?;
+    let filter = unsafe { part.GetTopologyObject()?.GetDeviceId()? };
+    let path = unsafe { filter.to_string()? };
+    unsafe { CoTaskMemFree(Some(filter.0.cast())) };
+    Ok(path)
 }
 
 fn endpoints() -> Result<Endpoints> {

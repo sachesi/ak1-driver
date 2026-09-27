@@ -5,15 +5,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, HANDLE, S_OK, WAIT_OBJECT_0};
-use windows::Win32::Media::Audio::AUDCLNT_E_UNSUPPORTED_FORMAT;
-use windows::Win32::System::Com::{CO_MTA_USAGE_COOKIE, CoDecrementMTAUsage, CoIncrementMTAUsage};
+use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, ERROR_BUSY, HANDLE, S_OK, WAIT_OBJECT_0};
 use windows::Win32::System::Registry::{REG_NOTIFY_CHANGE_LAST_SET, RegCloseKey, RegNotifyChangeKeyValue};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
-use windows_core::{GUID, IUnknown, Interface};
+use windows_core::{GUID, HSTRING, IUnknown, Interface};
 
 use crate::abi::*;
-use crate::duplex::{Clock, Duplex, Endpoints, Host, INPUTS, OUTPUTS, find_endpoints, join_worker, request_reset};
+use crate::duplex::{Clock, Duplex, Host, INPUTS, OUTPUTS, find_device, join_worker, request_reset};
 use crate::settings::{
     self, RATES, Settings, TRANSFER_MS, max_buffer_frames, min_buffer_frames,
 };
@@ -37,26 +35,13 @@ struct Session {
 }
 
 struct Driver {
-    /// Keeps a multithreaded apartment alive so the endpoints work from the
-    /// host's threads and the streaming thread without joining the host's
-    /// threads to an apartment.
-    mta: Option<CO_MTA_USAGE_COOKIE>,
-    endpoints: Option<Endpoints>,
+    /// Path of the kernel driver's filter that streams for ASIO.
+    device: Option<HSTRING>,
     error: String,
     rate: u32,
     /// The rate the host last read the buffer sizes at.
     listed_rate: Option<u32>,
     session: Option<Session>,
-}
-
-impl Drop for Driver {
-    fn drop(&mut self) {
-        self.session = None;
-        self.endpoints = None;
-        if let Some(cookie) = self.mta.take() {
-            let _ = unsafe { CoDecrementMTAUsage(cookie) };
-        }
-    }
 }
 
 #[repr(C)]
@@ -68,17 +53,13 @@ pub struct AsioObject {
     watch: Mutex<Option<SettingsWatch>>,
 }
 
-// The endpoints and streams are free-threaded COM objects.
-unsafe impl Send for Driver {}
-
 impl AsioObject {
     pub fn create() -> *mut AsioObject {
         Box::into_raw(Box::new(AsioObject {
             vtbl: &VTBL,
             refs: AtomicU32::new(1),
             driver: Mutex::new(Driver {
-                mta: None,
-                endpoints: None,
+                device: None,
                 error: String::new(),
                 rate: Settings::load().sample_rate,
                 listed_rate: None,
@@ -234,26 +215,17 @@ unsafe extern "system" fn init(this: *mut AsioObject, _sys_handle: *mut c_void) 
     }
     drop(watch);
     let mut driver = object.driver();
-    if driver.mta.is_none() {
-        match unsafe { CoIncrementMTAUsage() } {
-            Ok(cookie) => driver.mta = Some(cookie),
-            Err(e) => {
-                driver.error = format!("starting COM failed: {e}");
-                return 0;
-            }
-        }
-    }
-    match find_endpoints() {
-        Ok(Some(endpoints)) => {
-            driver.endpoints = Some(endpoints);
+    match find_device() {
+        Ok(Some(device)) => {
+            driver.device = Some(device);
             1
         }
         Ok(None) => {
-            driver.error = "Audio Kontrol 1 endpoints not found; is the device connected?".into();
+            driver.error = "Audio Kontrol 1 not found; is the device connected?".into();
             0
         }
         Err(e) => {
-            driver.error = format!("enumerating audio endpoints failed: {e}");
+            driver.error = format!("looking for the device failed: {e}");
             0
         }
     }
@@ -290,6 +262,9 @@ unsafe extern "system" fn start(this: *mut AsioObject) -> AsioError {
                 request_reset(&callbacks);
             }
             ASE_OK
+        }
+        Err(e) if e.code() == ERROR_BUSY.to_hresult() => {
+            driver.fail(ASE_HW_MALFUNCTION, "another ASIO host is using the device")
         }
         Err(e) => driver.fail(ASE_HW_MALFUNCTION, format!("starting streams failed: {e}")),
     }
@@ -329,10 +304,12 @@ unsafe extern "system" fn get_latencies(this: *mut AsioObject, input: *mut i32, 
         .session
         .as_ref()
         .map_or(Settings::load().buffer_frames(driver.rate) as i32, |s| s.host.buffer_frames as i32);
+    // Input waits for the transfer that completes its period; output passes
+    // one transfer in the kernel driver and one on the bus.
     let transfer = (driver.rate * TRANSFER_MS / 1000) as i32;
     unsafe {
         *input = frames + transfer;
-        *output = 2 * frames + transfer;
+        *output = frames + 2 * transfer;
     }
     ASE_OK
 }
@@ -455,7 +432,7 @@ unsafe extern "system" fn create_buffers(
     if driver.session.is_some() {
         return driver.fail(ASE_INVALID_MODE, "buffers already exist");
     }
-    let Some(endpoints) = driver.endpoints.as_ref() else {
+    let Some(device) = driver.device.as_ref() else {
         return driver.fail(ASE_NOT_PRESENT, "driver not initialized");
     };
     let rate = driver.rate;
@@ -514,13 +491,9 @@ unsafe extern "system" fn create_buffers(
     host.time_info = unsafe {
         ((*callbacks).asio_message)(K_ASIO_SUPPORTS_TIME_INFO, 0, std::ptr::null_mut(), std::ptr::null_mut())
     } == 1;
-    let duplex = match Duplex::open(endpoints, &host) {
+    let duplex = match Duplex::open(device) {
         Ok(duplex) => duplex,
-        // The device has one clock, which another stream may hold at another rate.
-        Err(e) if e.code() == AUDCLNT_E_UNSUPPORTED_FORMAT => {
-            return driver.fail(ASE_NO_CLOCK, format!("another application is using the device at a rate other than {rate} Hz"));
-        }
-        Err(e) => return driver.fail(ASE_HW_MALFUNCTION, format!("opening the device at {rate} Hz failed: {e}")),
+        Err(e) => return driver.fail(ASE_HW_MALFUNCTION, format!("opening the device failed: {e}")),
     };
     let stale_size = buffer_size < rate_min;
     driver.session = Some(Session { duplex, buffers, host, active_inputs, active_outputs, running: false, stale_size });
