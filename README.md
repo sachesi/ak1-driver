@@ -6,8 +6,9 @@ no vendor driver for current Windows. It is written in Rust:
 - `ak1acx.sys`, a kernel driver built on KMDF and the Audio Class Extension
   (ACX). It exposes outputs 1/2, outputs 3/4 and inputs 1/2 as Windows audio
   endpoints at 44.1, 48, 88.2, 96 and 192 kHz, 16 or 24 bit.
-- `ak1_asio.dll`, an ASIO 2 driver that streams through those endpoints in
-  exclusive mode.
+- `ak1_asio.dll`, an ASIO 2 driver. The kernel driver mixes its output with
+  the endpoints', so other programs keep playing and recording while a DAW
+  uses it.
 - `ak1-panel.exe`, a control panel for the ASIO settings, the device status
   and output and input tests.
 - `ak1-setup.exe`, which carries the other three and installs or removes them.
@@ -41,10 +42,13 @@ settings if needed. The ASIO driver shows up as "Audio Kontrol 1".
 
 ## Using it
 
-The card has one sample clock, so every stream runs at the rate of the first
-one opened. Opening another endpoint at a different rate fails until the first
-is closed; the ASIO driver reports this as "another application is using the
-device at a rate other than ... Hz".
+The card has one sample clock. A DAW on the ASIO driver sets its rate,
+otherwise the first stream opened does, and streams at other rates are
+converted to it. Windows plays each endpoint at the rate chosen in Sound
+settings (Properties, Advanced), so other programs stay audible whatever rate
+the DAW uses. When a DAW starts at a rate other than the card's, other sound
+stops for a moment while the card switches. One DAW at a time can use the
+ASIO driver.
 
 "Audio Kontrol 1 Control Panel" in the Start menu, or a DAW's ASIO settings
 button, opens the control panel. It sets the sample rate and buffer size the
@@ -55,8 +59,7 @@ and 48 kHz, 128 to 4096 at 88.2 and 96 kHz, 256 to 8192 at 192 kHz. DAWs that
 list the sizes only once, such as Ardour, get the list for the panel's rate.
 The panel also shows whether the card is working, the driver and firmware
 versions and the error counts of the last stream, plays a test tone on either
-output pair and meters the inputs. While the meter is on it holds the card at
-the Windows sample rate.
+output pair and meters the inputs.
 
 The front phones output sums left and right and follows the 1/2 - 3/4 selector
 next to it. The output 1/2 and 3/4 level knobs only affect the rear outputs.
