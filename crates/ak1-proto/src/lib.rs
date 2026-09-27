@@ -15,6 +15,7 @@ extern crate alloc;
 
 pub mod asio;
 pub mod mode2;
+pub mod resample;
 
 pub const VENDOR_ID: u16 = 0x17cc;
 pub const PRODUCT_ID: u16 = 0x0815;
